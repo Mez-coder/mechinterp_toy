@@ -26,6 +26,16 @@ def run_rollout(cfg, idx, agent):
     d = io.rollout_dir(cfg.run_dir(), idx)
     io.save_case(d, env, seed)
 
+    # ground-truth constrained optimum for THIS case (deterministic; cheap)
+    opt = env.optimum(samples=cfg.optimum_samples)
+    opt_meta = dict(optimum_feasible=opt.get('feasible', False),
+                    optimum_margin_priority=opt.get('margin_priority'),
+                    optimum_weights=opt.get('weights'))
+
+    def _gap(snap):
+        return (opt['margin_priority'] - snap['margin_priority']) \
+            if opt.get('feasible') else None
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": render_case(env, cfg.max_turns)}]
 
@@ -35,7 +45,7 @@ def run_rollout(cfg, idx, agent):
     for turn in range(1, cfg.max_turns + 1):
         cap = os.path.join(d, "activations", f"turn_{turn:02d}.npz") if cfg.capture else None
         text, meta = agent.act(messages, capture_path=cap if agent.is_model else None)
-        action = parse_action(text)
+        action = parse_action(text, env.n_obj)
         messages.append({"role": "assistant", "content": text})
 
         rec = dict(turn=turn, action=action.kind, weights=action.weights,
@@ -46,7 +56,8 @@ def run_rollout(cfg, idx, agent):
             snap = env.submit()['plan']
             io.save_submission(d, snap, dict(submit_turn=turn, forced=False,
                                              n_turns=turn,
-                                             first_pass_turn=first_pass_turn))
+                                             first_pass_turn=first_pass_turn,
+                                             optimality_gap=_gap(snap), **opt_meta))
             io.append_transcript(d, rec)
             submitted = True
             break
@@ -61,11 +72,13 @@ def run_rollout(cfg, idx, agent):
             rec["all_pass"] = env.all_pass()
             rec["weight_vec"] = env.w.tolist()
             messages.append({"role": "user",
-                             "content": render_feedback(fb, turn=turn, max_turns=cfg.max_turns)})
+                             "content": render_feedback(fb, turn=turn, max_turns=cfg.max_turns,
+                                                        priority=env.priority)})
         else:                                    # parse error -> tell agent, costs a turn
             messages.append({"role": "user",
                              "content": f"Could not parse an action ({action.error}).\n"
-                             + render_feedback(env.feedback(), turn=turn, max_turns=cfg.max_turns)})
+                             + render_feedback(env.feedback(), turn=turn, max_turns=cfg.max_turns,
+                                               priority=env.priority)})
 
         io.append_transcript(d, rec)
 
@@ -73,7 +86,8 @@ def run_rollout(cfg, idx, agent):
         snap = env.submit()['plan']
         io.save_submission(d, snap, dict(submit_turn=cfg.max_turns, forced=True,
                                          n_turns=cfg.max_turns,
-                                         first_pass_turn=first_pass_turn))
+                                         first_pass_turn=first_pass_turn,
+                                         optimality_gap=_gap(snap), **opt_meta))
         io.append_transcript(d, dict(turn=cfg.max_turns, action="forced_submit",
                                      weights={}, error="", response="",
                                      all_pass=env.all_pass(), weight_vec=env.w.tolist(),

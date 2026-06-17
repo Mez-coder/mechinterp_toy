@@ -1,19 +1,17 @@
-"""Agents producing an action string from the message history.
+"""Agents that produce an action string given the message history.
 
-HumanAgent -- you type the action (for --human roleplay; needs no torch).
-ModelAgent -- loads an HF causal LM, generates on-policy, optionally captures
-              residual-stream activations at the decision token.
+HumanAgent  -- you type the action (for --human roleplay).
+ModelAgent  -- loads the HF model, generates, optionally captures activations.
 
-Generation is fully on-policy: the model emits every token. An action
-stop-criterion halts the instant one COMPLETE action line (SET.../SUBMIT + a
-newline) appears, so the model can't run past its own decision into a
-hallucinated re-evaluation. Truncating its own output is on-policy; if it never
-reaches an action within cfg.max_new_tokens that is recorded as an honest
-outcome rather than patched over.
+torch/transformers are imported lazily inside ModelAgent so --human needs neither.
 
-NOTE: defaults to AutoModelForCausalLM (e.g. gemma-2-9b-it, a text model). For a
-multimodal checkpoint (e.g. gemma-3), swap to AutoModelForImageTextToText +
-AutoProcessor as in your original agents.py -- the rest is unchanged.
+Generation is fully on-policy: the model produces every token itself. The only
+control is an action stop-criteria that halts the instant one COMPLETE action
+line (SET.../SUBMIT terminated by a newline) is emitted, so the model can't run
+PAST its decision into a hallucinated 're-evaluation'. Truncating the model's own
+output is on-policy (no tokens are inserted); if it never reaches an action
+within cfg.max_new_tokens, that is recorded as an honest outcome rather than
+patched over.
 """
 from __future__ import annotations
 import os
@@ -23,10 +21,12 @@ class HumanAgent:
     is_model = False
 
     def act(self, messages, capture_path=None):
+        # show the latest environment turn, then read one action line
         print("\n" + "=" * 70)
         print(messages[-1]["content"])
         print("=" * 70)
-        return input("your action > ").strip(), {"source": "human"}
+        text = input("your action > ").strip()
+        return text, {"source": "human"}
 
 
 class ModelAgent:
@@ -34,12 +34,19 @@ class ModelAgent:
 
     def __init__(self, cfg):
         import torch
-        from transformers import AutoTokenizer, AutoModelForCausalLM
         self.cfg = cfg
-        self.tok = AutoTokenizer.from_pretrained(cfg.model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name, dtype=torch.bfloat16, device_map="auto")
+
+        from transformers import AutoProcessor, AutoModelForImageTextToText
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            cfg.model_name,
+            dtype=torch.bfloat16,
+            device_map="auto",          # or cfg.device if you know it is supported
+        )
+
+        self.processor = AutoProcessor.from_pretrained(cfg.model_name)
+
         self.model.eval()
+        self.device = cfg.device
 
     def _build_inputs(self, messages):
         # Gemma has no system role -> fold system text into the first user turn.
@@ -51,48 +58,66 @@ class ModelAgent:
                 m = {"role": "user", "content": sys_txt + "\n\n" + m["content"]}
                 sys_txt = None
             msgs.append(m)
-        ids = self.tok.apply_chat_template(
-            msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt")
-        return ids.to(self.model.device)
+        out = self.processor.apply_chat_template(
+            msgs,
+            tokenize=True,
+            enable_thinking=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+
+        if hasattr(out, "keys"):
+            out = out["input_ids"]
+
+        return out.to(self.model.device)
 
     def _action_stopper(self, prompt_len):
-        """Halt as soon as one COMPLETE action line (newline-terminated
-        SET.../SUBMIT) appears. Only truncates the model's own tokens -> on-policy."""
+        """StoppingCriteria that halts as soon as one COMPLETE action line
+        (newline-terminated SET.../SUBMIT) appears in the generated text.
+        This only truncates the model's own tokens -- it is on-policy."""
         from transformers import StoppingCriteria, StoppingCriteriaList
         import torch
         from .dsl import parse_action
-        tok = self.tok
+        tok = self.processor
+        n_obj = self.cfg.n_obj                      # SET needs this many numbers to be complete
 
         class _ActionStop(StoppingCriteria):
             def __call__(self, input_ids, scores=None, **kw):
                 done = []
                 for row in input_ids:
                     hit = False
+                    # cheap gate: only inspect lines when the latest token ended one
                     tail = tok.decode(row[-1:].tolist(), skip_special_tokens=True)
-                    if "\n" in tail:                              # cheap gate
+                    if "\n" in tail:
                         text = tok.decode(row[prompt_len:], skip_special_tokens=True)
-                        for ln in text.split("\n")[:-1]:          # complete lines only
-                            if parse_action(ln).kind in ("set", "submit"):
-                                hit = True; break
+                        for ln in text.split("\n")[:-1]:        # complete lines only
+                            if parse_action(ln, n_obj).kind in ("set", "submit"):
+                                hit = True
+                                break
                     done.append(hit)
                 return torch.tensor(done, dtype=torch.bool, device=input_ids.device)
 
         return StoppingCriteriaList([_ActionStop()])
 
-    def _generate(self, ids, stopper):
+    def _generate(self, ids, max_new, stopper):
         import torch
         return self.model.generate(
-            ids, max_new_tokens=self.cfg.max_new_tokens,
+            ids, max_new_tokens=max_new,
             do_sample=self.cfg.temperature > 0, temperature=self.cfg.temperature,
-            pad_token_id=self.tok.eos_token_id,
-            attention_mask=torch.ones_like(ids),
+            pad_token_id=self.processor.tokenizer.eos_token_id,
+            attention_mask=torch.ones_like(ids),     # silences the attn-mask warning
             stopping_criteria=stopper)
 
     def act(self, messages, capture_path=None):
         ids = self._build_inputs(messages)
         prompt_len = ids.shape[1]
-        full = self._generate(ids, self._action_stopper(prompt_len))
-        text = self.tok.decode(full[0, prompt_len:], skip_special_tokens=True).strip()
+
+        # single on-policy pass; stop at the first complete action line
+        full = self._generate(ids, self.cfg.max_new_tokens,
+                              self._action_stopper(prompt_len))
+
+        text = self.processor.decode(full[0, prompt_len:], skip_special_tokens=True).strip()
         meta = {"source": "model", "prompt_len": int(prompt_len),
                 "resp_len": int(full.shape[1] - prompt_len),
                 "temperature": self.cfg.temperature}

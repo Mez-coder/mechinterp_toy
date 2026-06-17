@@ -7,10 +7,10 @@ import os
 @dataclass
 class Config:
     # --- model ---
-    model_name: str = "google/gemma-2-9b-it"
+    model_name: str = "Qwen/Qwen3.5-9B"
     device: str = "cuda"
     temperature: float = 0.7
-    max_new_tokens: int = 64
+    max_new_tokens: int = 528
     # --- activation capture (see recorder.py) ---
     capture: bool = True
     capture_tokens: str = "lastk"        # 'decision' | 'lastk' | 'assistant'
@@ -26,6 +26,7 @@ class Config:
     n_obj: int = 3
     beta: float = 4.0
     case_jitter: float = 0.1             # per-case randomisation of m0/G/C (0 = fixed)
+    optimum_samples: int = 50000         # MC samples for the per-case ground-truth optimum
     m0: object = None                    # optional explicit arrays; else env defaults
     G: object = None
     C: object = None

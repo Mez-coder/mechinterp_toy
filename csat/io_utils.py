@@ -13,6 +13,7 @@ def rollout_dir(run_dir, idx):
 def save_case(d, env, seed):
     with open(os.path.join(d, "case.json"), "w") as f:
         json.dump(dict(seed=int(seed), n_obj=env.n_obj, beta=env.beta,
+                       priority=int(env.priority),
                        m0=env.m0_case.tolist(), G=env.G_case.tolist(),
                        C=env.C_case.tolist()), f, indent=2)
     open(os.path.join(d, "transcript.jsonl"), "w").close()   # fresh log per (re)run
@@ -29,6 +30,8 @@ def save_submission(d, snapshot, meta):
                margins=snapshot['margins'].tolist(),
                all_pass=snapshot['all_pass'],
                total_margin=snapshot['total_margin'],
-               total_weight=snapshot['total_weight'])
+               total_weight=snapshot['total_weight'],
+               priority=snapshot['priority'],
+               margin_priority=snapshot['margin_priority'])
     with open(os.path.join(d, "submission.json"), "w") as f:
         json.dump(out, f, indent=2)

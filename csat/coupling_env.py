@@ -59,10 +59,11 @@ class CouplingEnv:
         # case arrays default to the base arrays until reset() jitters them
         self.m0_case, self.G_case, self.C_case = self.m0, self.G, self.C
         self.w = np.zeros(n)
+        self.priority = 0
         self.submitted = False
 
     # --- per-case difficulty randomisation (analogue of your sampled limits) ---
-    def reset(self, seed=None, jitter=0.0):
+    def reset(self, seed=None, jitter=0.0, priority=None):
         rng = np.random.default_rng(seed)
         n = self.n_obj
         self.m0_case = self.m0 + jitter * rng.normal(size=n)
@@ -70,6 +71,9 @@ class CouplingEnv:
         C = self.C * (1.0 + jitter * rng.normal(size=(n, n)))
         np.fill_diagonal(C, 0.0)
         self.C_case = np.clip(C, 0.0, None)
+        # one objective is THIS case's priority: keep all passing, then push its
+        # margin as high as possible. Sampled per case unless fixed by caller.
+        self.priority = int(rng.integers(n)) if priority is None else int(priority)
         self.w = np.zeros(n)
         self.submitted = False
         return self.feedback()
@@ -102,7 +106,29 @@ class CouplingEnv:
         return dict(weights=self.w.copy(), margins=m.copy(),
                     all_pass=bool(np.all(m >= 0)),
                     total_margin=float(m.sum()),
-                    total_weight=float(self.w.sum()))
+                    total_weight=float(self.w.sum()),
+                    priority=int(self.priority),
+                    margin_priority=float(m[self.priority]))
+
+    def optimum(self, samples=50000, seed=0):
+        """Monte-Carlo ground truth for THIS case: the largest priority margin
+        achievable among plans where EVERY objective passes. Use offline to score
+        how close the model's submitted plan is to the constrained optimum."""
+        rng = np.random.default_rng(seed)
+        W = rng.random((samples, self.n_obj))
+        self_term = self.G_case * gain(W, self.beta)            # (S,n)
+        cross = harm(W).dot(self.C_case.T)                      # (S,n) = sum_j C_ij harm(w_j)
+        M = self.m0_case + self_term - cross
+        feas = np.all(M >= 0, axis=1)
+        if not feas.any():
+            return dict(feasible=False, priority=int(self.priority))
+        Wf, Mf = W[feas], M[feas]
+        k = self.priority
+        b = int(np.argmax(Mf[:, k]))
+        return dict(feasible=True, priority=k,
+                    weights=Wf[b].round(4).tolist(),
+                    margins=Mf[b].round(4).tolist(),
+                    margin_priority=float(Mf[b, k]))
 
     # --- offline sanity: where does a symmetric plan first pass, and what does
     #     pushing every weight to the rail cost? (reveals the regime) ---
