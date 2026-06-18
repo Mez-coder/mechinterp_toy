@@ -47,13 +47,14 @@ class CouplingEnv:
     m0: object = None            # (n,)   baseline deficit, < 0 -> starts failing
     G: object = None             # (n,)   self-gain scale
     C: object = None             # (n,n)  cross-harm, zero diagonal
+    grid: float = 0.0                    # NEW: weight discretisation step (0 = off)
 
     def __post_init__(self):
         n = self.n_obj
         self.m0 = np.full(n, -0.5) if self.m0 is None else np.asarray(self.m0, float)
         self.G = np.ones(n) if self.G is None else np.asarray(self.G, float)
         if self.C is None:
-            self.C = 0.25 * (np.ones((n, n)) - np.eye(n))
+            self.C = 0.2 * (np.ones((n, n)) - np.eye(n))
         self.C = np.asarray(self.C, float)
         np.fill_diagonal(self.C, 0.0)
         # case arrays default to the base arrays until reset() jitters them
@@ -86,7 +87,10 @@ class CouplingEnv:
         return self.m0_case + self_term - cross
 
     def set_weight(self, i, value):
-        self.w[i] = float(np.clip(value, 0.0, 1.0))
+        v = float(np.clip(value, 0.0, 1.0))
+        if self.grid:                                # snap to the grid the model is told to use
+            v = float(np.clip(round(v / self.grid) * self.grid, 0.0, 1.0))
+        self.w[i] = v
 
     def all_pass(self, w=None):
         return bool(np.all(self.margins(w) >= 0))
@@ -110,10 +114,13 @@ class CouplingEnv:
                     priority=int(self.priority),
                     margin_priority=float(m[self.priority]))
 
+
     def optimum(self, samples=50000, seed=0):
         """Monte-Carlo ground truth for THIS case: the largest priority margin
         achievable among plans where EVERY objective passes. Use offline to score
         how close the model's submitted plan is to the constrained optimum."""
+        if self.grid:
+            return self._optimum_grid()
         rng = np.random.default_rng(seed)
         W = rng.random((samples, self.n_obj))
         self_term = self.G_case * gain(W, self.beta)            # (S,n)
@@ -129,6 +136,23 @@ class CouplingEnv:
                     weights=Wf[b].round(4).tolist(),
                     margins=Mf[b].round(4).tolist(),
                     margin_priority=float(Mf[b, k]))
+
+    def _optimum_grid(self):
+        """Exact constrained optimum over the discrete grid (same return shape as
+        the MC version). For 2 objectives this is 121 cells -- trivially exhaustive."""
+        import itertools
+        steps = np.round(np.arange(0.0, 1.0 + 1e-9, self.grid), 6)
+        k, best = self.priority, None
+        for combo in itertools.product(steps, repeat=self.n_obj):
+            m = self.margins(np.asarray(combo, float))
+            if np.all(m >= 0) and (best is None or m[k] > best[1]):
+                best = (np.asarray(combo, float), float(m[k]), m)
+        if best is None:
+            return dict(feasible=False, priority=int(k))
+        w, mk, m = best
+        return dict(feasible=True, priority=int(k),
+                    weights=w.round(4).tolist(), margins=m.round(4).tolist(),
+                    margin_priority=mk)
 
     # --- offline sanity: where does a symmetric plan first pass, and what does
     #     pushing every weight to the rail cost? (reveals the regime) ---

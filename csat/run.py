@@ -12,6 +12,7 @@ import argparse
 from .config import Config
 from .agents import HumanAgent, ModelAgent
 from .rollout import run_rollout
+from . import io_utils as io
 
 
 def main():
@@ -30,7 +31,10 @@ def main():
         cfg.capture = False
 
     agent = HumanAgent() if args.human else ModelAgent(cfg)
-    for idx in range(cfg.n_rollouts):
+    start = io.next_rollout_idx(cfg.run_dir())
+    if start:
+        print(f"resuming: {start} completed rollouts found; continuing from idx {start}")
+    for idx in range(start, start + cfg.n_rollouts):
         r = run_rollout(cfg, idx, agent)
         print(f"rollout {idx:04d}: submitted={r['submitted']} forced={r['forced']} "
               f"first_pass_turn={r['first_pass_turn']} -> {r['dir']}")

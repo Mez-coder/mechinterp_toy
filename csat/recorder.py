@@ -80,18 +80,34 @@ def _positions(tokens, prompt_len, seq, last_k):
         pos = list(range(max(prompt_len, seq - k), seq))
     return pos or [seq - 1]
 
+def _forward_hidden_states(model, full_ids):
+    """Hidden states only. We never use logits, and computing the lm_head over a
+    long sequence is what OOMs (seq x vocab). logits_to_keep=1 restricts the head
+    to one position; older transformers used num_logits_to_keep; last resort is
+    the base transformer, which has no lm_head at all."""
+    import torch
+    kw = dict(output_hidden_states=True, use_cache=False)
+    with torch.no_grad():
+        for extra in ({"logits_to_keep": 1}, {"num_logits_to_keep": 1}):
+            try:
+                return model(full_ids, **kw, **extra).hidden_states
+            except TypeError:
+                continue
+        base = getattr(model, "model", model)        # skip lm_head entirely
+        return base(full_ids, **kw).hidden_states
 
 def capture_and_save(model, full_ids, prompt_len, path, tokens="lastk",
                      dtype="float16", last_k=5):
     import torch
-    with torch.no_grad():
-        out = model(full_ids, output_hidden_states=True, use_cache=False)
-    hs = out.hidden_states                      # tuple (L+1) of (1, seq, d_model)
+    hs = _forward_hidden_states(model, full_ids)     # tuple (L+1) of (1, seq, d)
     seq = full_ids.shape[1]
     positions = _positions(tokens, prompt_len, seq, last_k)
     idx = torch.tensor(positions, device=hs[0].device)
     stack = torch.stack([h[0].index_select(0, idx) for h in hs])   # (L+1, n_pos, d)
-    acts = stack.to(torch.float32).cpu().numpy()                   # bf16 -> f32 (lossless)
+    acts = stack.to(torch.float32).cpu().numpy()
+    del hs, stack
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()                     # release the long-seq forward
     np.savez_compressed(
         path,
         acts=_to_storage(acts, dtype),

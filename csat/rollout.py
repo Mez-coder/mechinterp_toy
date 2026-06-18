@@ -10,15 +10,15 @@ pushing -- can be reconstructed offline.
 from __future__ import annotations
 import os
 from .coupling_env import CouplingEnv
-from .dsl import parse_action, render_feedback
 from .prompts import SYSTEM_PROMPT, render_case
+from .dsl import parse_action, render_feedback, split_thinking
 from . import io_utils as io
 
 
 def build_env(cfg):
-    return CouplingEnv(n_obj=cfg.n_obj, beta=cfg.beta, m0=cfg.m0, G=cfg.G, C=cfg.C)
-
-
+    return CouplingEnv(n_obj=cfg.n_obj, beta=cfg.beta, m0=cfg.m0, G=cfg.G, C=cfg.C,
+                       grid=getattr(cfg, "grid", 0.0))
+                       
 def run_rollout(cfg, idx, agent):
     seed = cfg.seed_start + idx
     env = build_env(cfg)
@@ -45,14 +45,22 @@ def run_rollout(cfg, idx, agent):
     for turn in range(1, cfg.max_turns + 1):
         cap = os.path.join(d, "activations", f"turn_{turn:02d}.npz") if cfg.capture else None
         text, meta = agent.act(messages, capture_path=cap if agent.is_model else None)
-        action = parse_action(text, env.n_obj)
-        messages.append({"role": "assistant", "content": text})
+        answer, _ = split_thinking(text, cfg.enable_thinking)
+        action = parse_action(answer, env.n_obj)
+        messages.append({"role": "assistant", "content": answer})   # strip <think> from context
 
         rec = dict(turn=turn, action=action.kind, weights=action.weights,
-                   error=action.error, response=text,
-                   all_pass=env.all_pass(), weight_vec=env.w.tolist(), meta=meta)
+                error=action.error, response=text,                # keep FULL text (reasoning) in the record
+                all_pass=env.all_pass(), weight_vec=env.w.tolist(), meta=meta)
 
         if action.kind == "submit":
+            for i, w in action.weights.items():          # NEW: submit carries the final plan
+                if 0 <= i < env.n_obj:
+                    env.set_weight(i, w)
+            if first_pass_turn is None and env.all_pass():
+                first_pass_turn = turn
+            rec["all_pass"] = env.all_pass()             # was pre-submit state; refresh
+            rec["weight_vec"] = env.w.tolist()
             snap = env.submit()['plan']
             io.save_submission(d, snap, dict(submit_turn=turn, forced=False,
                                              n_turns=turn,

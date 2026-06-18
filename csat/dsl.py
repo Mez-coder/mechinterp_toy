@@ -33,34 +33,55 @@ class Action:
     raw: str = ""
 
 
+_VERB = re.compile(r'\b(SET|SUBMIT)\b', re.IGNORECASE)
+# numbers must begin IMMEDIATELY after the verb (only spaces/commas/colons/'='
+# between), so "set the weights..." in prose is NOT mistaken for an action.
+_ARG_RUN = re.compile(r'[\s:=,]*(-?\d+(?:\.\d+)?(?:[ \t,]+-?\d+(?:\.\d+)?)*)')
+_NUM = re.compile(r'-?\d+(?:\.\d+)?')
+
+
 def parse_action(text, n_obj):
     raw = text or ""
-    example = "SET " + " ".join("0.3" for _ in range(n_obj))
-    for m in _SET.finditer(raw):                 # try each 'SET'; skip prose ones
-        run = _SET_RUN.match(raw[m.end():])
+    set_ex = "SET " + " ".join("0.3" for _ in range(n_obj))
+    sub_ex = "SUBMIT " + " ".join("0.3" for _ in range(n_obj))
+    for m in _VERB.finditer(raw):                # first verb with a valid number run wins
+        verb = m.group(1).lower()
+        run = _ARG_RUN.match(raw[m.end():])
         if not run:
-            continue                             # 'SET' not immediately followed by a number
+            continue                             # verb not immediately followed by a number -> prose
         nums = _NUM.findall(run.group(1))
         if len(nums) != n_obj:
+            ex = set_ex if verb == "set" else sub_ex
             return Action('parse_error', raw=raw,
-                          error=f"SET must be immediately followed by exactly {n_obj} "
-                                f"numbers, e.g. '{example}'; got {len(nums)}")
+                          error=f"{verb.upper()} must be immediately followed by exactly "
+                                f"{n_obj} numbers, e.g. '{ex}'; got {len(nums)}")
         vals = [float(x) for x in nums]
         bad = {i + 1: v for i, v in enumerate(vals) if v < 0}
         if bad:
             return Action('parse_error', raw=raw,
                           error=f"negative weights not allowed: {bad}")
-        return Action('set', weights={i: vals[i] for i in range(n_obj)}, raw=raw)
-    # SUBMIT counts only when it stands alone on a line or is the final token,
-    # so prose like "I should not submit yet" does NOT end the episode.
-    for ln in raw.splitlines():
-        if re.fullmatch(r'[\W_]*submit[\W_]*', ln.strip(), re.IGNORECASE):
-            return Action('submit', raw=raw)
-    toks = raw.split()
-    if toks and re.fullmatch(r'[\W_]*submit[\W_]*', toks[-1], re.IGNORECASE):
-        return Action('submit', raw=raw)
+        return Action(verb, weights={i: vals[i] for i in range(n_obj)}, raw=raw)
     return Action('parse_error', raw=raw,
-                  error=f"no action found; write '{example}' or 'SUBMIT'")
+                  error=f"no action found; write '{set_ex}' or '{sub_ex}'")
+
+_THINK_CLOSE = "</think>"
+
+def split_thinking(text, thinking=True):
+    """Separate Qwen's reasoning block from its committed answer.
+
+    Returns (answer, still_thinking):
+      answer         -- text after the final </think> (where the real action
+                        lives), or the whole text when thinking is off.
+      still_thinking -- True if thinking is on and </think> hasn't appeared yet,
+                        i.e. there is no answer to parse/stop on.
+    """
+    raw = text or ""
+    if not thinking:
+        return raw, False
+    i = raw.rfind(_THINK_CLOSE)          # rfind: last close wins, robust to stray tags
+    if i == -1:
+        return "", True                  # still inside the scratchpad
+    return raw[i + len(_THINK_CLOSE):], False
 
 
 def render_feedback(rows, turn=None, max_turns=None, note=None, priority=None):
@@ -83,6 +104,8 @@ def render_feedback(rows, turn=None, max_turns=None, note=None, priority=None):
     if note:
         lines.append(note)
     example = "SET " + " ".join("0.3" for _ in range(n))
-    lines.append(f"Reply with one weight (0-1) per objective in order, e.g. '{example}', "
-                 "or 'SUBMIT' to finalise.")
+    set_ex = "SET " + " ".join("0.3" for _ in range(n))
+    sub_ex = "SUBMIT " + " ".join("0.3" for _ in range(n))
+    lines.append(f"Reply with one weight (0-1) per objective in order, e.g. '{set_ex}', "
+                 f"or '{sub_ex}' to finalise with those weights.")
     return "\n".join(lines)

@@ -61,7 +61,7 @@ class ModelAgent:
         out = self.processor.apply_chat_template(
             msgs,
             tokenize=True,
-            enable_thinking=True,
+            enable_thinking=self.cfg.enable_thinking,
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
@@ -73,28 +73,30 @@ class ModelAgent:
         return out.to(self.model.device)
 
     def _action_stopper(self, prompt_len):
-        """StoppingCriteria that halts as soon as one COMPLETE action line
-        (newline-terminated SET.../SUBMIT) appears in the generated text.
-        This only truncates the model's own tokens -- it is on-policy."""
+        """Halt on the first COMPLETE action line — but only once the model has
+        left the <think> block. While reasoning, never stop (on-policy: we only
+        truncate the model's own post-reasoning tokens)."""
         from transformers import StoppingCriteria, StoppingCriteriaList
         import torch
-        from .dsl import parse_action
+        from .dsl import parse_action, split_thinking
         tok = self.processor
-        n_obj = self.cfg.n_obj                      # SET needs this many numbers to be complete
+        n_obj = self.cfg.n_obj
+        thinking = self.cfg.enable_thinking
 
         class _ActionStop(StoppingCriteria):
             def __call__(self, input_ids, scores=None, **kw):
                 done = []
                 for row in input_ids:
                     hit = False
-                    # cheap gate: only inspect lines when the latest token ended one
                     tail = tok.decode(row[-1:].tolist(), skip_special_tokens=True)
-                    if "\n" in tail:
+                    if "\n" in tail:                       # cheap gate, unchanged
                         text = tok.decode(row[prompt_len:], skip_special_tokens=True)
-                        for ln in text.split("\n")[:-1]:        # complete lines only
-                            if parse_action(ln, n_obj).kind in ("set", "submit"):
-                                hit = True
-                                break
+                        answer, still_thinking = split_thinking(text, thinking)
+                        if not still_thinking:             # only inspect the answer region
+                            for ln in answer.split("\n")[:-1]:
+                                if parse_action(ln, n_obj).kind in ("set", "submit"):
+                                    hit = True
+                                    break
                     done.append(hit)
                 return torch.tensor(done, dtype=torch.bool, device=input_ids.device)
 
