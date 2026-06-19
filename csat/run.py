@@ -13,6 +13,8 @@ from .config import Config
 from .agents import HumanAgent, ModelAgent
 from .rollout import run_rollout
 from . import io_utils as io
+from .case_spread import pick_spread_seeds
+from .rollout import build_env
 
 
 def main():
@@ -34,10 +36,12 @@ def main():
     start = io.next_rollout_idx(cfg.run_dir())
     if start:
         print(f"resuming: {start} completed rollouts found; continuing from idx {start}")
-    for idx in range(start, start + cfg.n_rollouts):
-        r = run_rollout(cfg, idx, agent)
+    seeds = pick_spread_seeds(cfg, n_want=cfg.n_rollouts, build_env=build_env,
+                          seed_start=cfg.seed_start)
+    for idx, seed in enumerate(seeds):
+        r = run_rollout(cfg, idx, agent, seed=seed)          # <-- capture into r
         print(f"rollout {idx:04d}: submitted={r['submitted']} forced={r['forced']} "
-              f"first_pass_turn={r['first_pass_turn']} -> {r['dir']}")
+            f"first_pass_turn={r['first_pass_turn']}")
 
 
 if __name__ == "__main__":

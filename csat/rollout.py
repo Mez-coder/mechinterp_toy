@@ -14,15 +14,14 @@ from .prompts import SYSTEM_PROMPT, render_case
 from .dsl import parse_action, render_feedback, split_thinking
 from . import io_utils as io
 
-
 def build_env(cfg):
     return CouplingEnv(n_obj=cfg.n_obj, beta=cfg.beta, m0=cfg.m0, G=cfg.G, C=cfg.C,
                        grid=getattr(cfg, "grid", 0.0))
-                       
-def run_rollout(cfg, idx, agent):
-    seed = cfg.seed_start + idx
+
+def run_rollout(cfg, idx, agent, seed=None):
+    seed = (cfg.seed_start + idx) if seed is None else int(seed)
     env = build_env(cfg)
-    env.reset(seed=seed, jitter=cfg.case_jitter)
+    env.reset(seed=seed, wide=getattr(cfg, "wide_cases", True))   # was: jitter=cfg.case_jitter
     d = io.rollout_dir(cfg.run_dir(), idx)
     io.save_case(d, env, seed)
 

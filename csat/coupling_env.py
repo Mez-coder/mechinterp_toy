@@ -54,7 +54,7 @@ class CouplingEnv:
         self.m0 = np.full(n, -0.5) if self.m0 is None else np.asarray(self.m0, float)
         self.G = np.ones(n) if self.G is None else np.asarray(self.G, float)
         if self.C is None:
-            self.C = 0.2 * (np.ones((n, n)) - np.eye(n))
+            self.C = 0.3 * (np.ones((n, n)) - np.eye(n))
         self.C = np.asarray(self.C, float)
         np.fill_diagonal(self.C, 0.0)
         # case arrays default to the base arrays until reset() jitters them
@@ -64,16 +64,20 @@ class CouplingEnv:
         self.submitted = False
 
     # --- per-case difficulty randomisation (analogue of your sampled limits) ---
-    def reset(self, seed=None, jitter=0.0, priority=None):
+    def reset(self, seed=None, jitter=0.0, priority=None, wide=True):
         rng = np.random.default_rng(seed)
         n = self.n_obj
-        self.m0_case = self.m0 + jitter * rng.normal(size=n)
-        self.G_case = self.G * (1.0 + jitter * rng.normal(size=n))
-        C = self.C * (1.0 + jitter * rng.normal(size=(n, n)))
+        if wide:                                   # independent wide draws -> optima spread
+            self.m0_case = rng.uniform(-0.9, -0.05, size=n)
+            self.G_case  = rng.uniform(0.6, 1.6, size=n)
+            C = rng.uniform(0.05, 0.5, size=(n, n))
+            self.beta    = float(rng.uniform(2.5, 5.0))   # per-case curvature
+        else:                                      # old ±jitter behaviour
+            self.m0_case = self.m0 + jitter * rng.normal(size=n)
+            self.G_case  = self.G * (1.0 + jitter * rng.normal(size=n))
+            C = self.C * (1.0 + jitter * rng.normal(size=(n, n)))
         np.fill_diagonal(C, 0.0)
         self.C_case = np.clip(C, 0.0, None)
-        # one objective is THIS case's priority: keep all passing, then push its
-        # margin as high as possible. Sampled per case unless fixed by caller.
         self.priority = int(rng.integers(n)) if priority is None else int(priority)
         self.w = np.zeros(n)
         self.submitted = False
