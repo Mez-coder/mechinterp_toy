@@ -38,10 +38,21 @@ def main():
         print(f"resuming: {start} completed rollouts found; continuing from idx {start}")
     seeds = pick_spread_seeds(cfg, n_want=cfg.n_rollouts, build_env=build_env,
                           seed_start=cfg.seed_start)
-    for idx, seed in enumerate(seeds):
-        r = run_rollout(cfg, idx, agent, seed=seed)          # <-- capture into r
-        print(f"rollout {idx:04d}: submitted={r['submitted']} forced={r['forced']} "
-            f"first_pass_turn={r['first_pass_turn']}")
+    R = getattr(cfg, "repeats_per_case", 1)
+    for case_id, seed in enumerate(seeds):
+        # optimum is a property of the landscape -> compute ONCE per case and reuse,
+        # so MC noise in env.optimum() doesn't make the gap label wander across repeats
+        env = build_env(cfg); env.reset(seed=seed, wide=getattr(cfg, "wide_cases", True))
+        opt = env.optimum(samples=cfg.optimum_samples)
+        for rep in range(R):
+            idx = case_id * R + rep          # flat, resumable: case = idx//R, rep = idx%R
+            if idx < start:                  # skip already-done rollouts on resume
+                continue
+            r = run_rollout(cfg, idx, agent, seed=seed,
+                            case_id=case_id, rep=rep, opt=opt)
+            print(f"rollout {idx:04d} (case {case_id:03d} rep {rep}): "
+                f"submitted={r['submitted']} forced={r['forced']} "
+                f"first_pass_turn={r['first_pass_turn']}"))
 
 
 if __name__ == "__main__":

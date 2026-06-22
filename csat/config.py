@@ -9,7 +9,7 @@ class Config:
     # --- model ---
     model_name: str = "Qwen/Qwen3.5-9B"
     device: str = "cuda"
-    temperature: float = 0.4
+    temperature: float = 0.7
     max_new_tokens: int = 2048
     enable_thinking: bool = False
     # --- activation capture (see recorder.py) ---
@@ -19,9 +19,10 @@ class Config:
     capture_dtype: str = "bfloat16"      # lossless for a bf16 model (needs ml_dtypes)
     # --- rollout ---
     out_dir: str = "runs"
-    run_name: str = "csat_discrete"
+    run_name: str = "csat"
     seed_start: int = 0
-    n_rollouts: int = 200
+    n_rollouts: int = 200          # number of DISTINCT cases (landscapes)
+    repeats_per_case: int = 1      # R: independent rollouts per case (same landscape, fresh sampling)
     max_turns: int = 50
     # --- env ---
     # --- env ---

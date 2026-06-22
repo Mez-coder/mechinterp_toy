@@ -18,18 +18,20 @@ def build_env(cfg):
     return CouplingEnv(n_obj=cfg.n_obj, beta=cfg.beta, m0=cfg.m0, G=cfg.G, C=cfg.C,
                        grid=getattr(cfg, "grid", 0.0))
 
-def run_rollout(cfg, idx, agent, seed=None):
+
+def run_rollout(cfg, idx, agent, seed=None, case_id=None, rep=0, opt=None):
     seed = (cfg.seed_start + idx) if seed is None else int(seed)
     env = build_env(cfg)
-    env.reset(seed=seed, wide=getattr(cfg, "wide_cases", True))   # was: jitter=cfg.case_jitter
+    env.reset(seed=seed, wide=getattr(cfg, "wide_cases", True))
     d = io.rollout_dir(cfg.run_dir(), idx)
     io.save_case(d, env, seed)
 
-    # ground-truth constrained optimum for THIS case (deterministic; cheap)
-    opt = env.optimum(samples=cfg.optimum_samples)
+    if opt is None:                      # fallback if called standalone
+        opt = env.optimum(samples=cfg.optimum_samples)
     opt_meta = dict(optimum_feasible=opt.get('feasible', False),
                     optimum_margin_priority=opt.get('margin_priority'),
-                    optimum_weights=opt.get('weights'))
+                    optimum_weights=opt.get('weights'),
+                    case_id=case_id, rep=rep, case_seed=seed)   # <-- grouping keys
 
     def _gap(snap):
         return (opt['margin_priority'] - snap['margin_priority']) \
