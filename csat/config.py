@@ -28,7 +28,7 @@ class Config:
     # --- env selection ---
     env_kind: str = "parabola"        # "coupling" | "parabola"
     # --- parabola env (used when env_kind == "parabola") ---
-    par_a: float = 0.15                 # floor tilt: 0 = flat floor, >0 = gentle central gradient
+    par_a: float = 0.4                 # floor tilt: 0 = flat floor, >0 = gentle central gradient
     par_b: float = 1.0                  # wall steepness (quartic)
     par_z_pass_frac: float = 0.4        # pass threshold as fraction of z at the 0.5 start
 

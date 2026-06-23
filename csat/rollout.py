@@ -11,11 +11,11 @@ from __future__ import annotations
 import os
 from .coupling_env import CouplingEnv
 from .prompts import SYSTEM_PROMPT, render_case
-from .dsl import parse_action, render_feedback, split_thinking
+from .dsl import parse_action, split_thinking
 from . import io_utils as io
 from .coupling_env import CouplingEnv
 from .parabola_env import ParabolaEnv      # NEW
-from .prompts import system_prompt_for, render_case_for
+from .prompts import system_prompt_for, render_case_for, render_feedback_for
 
 def build_env(cfg):
     kind = getattr(cfg, "env_kind", "coupling")
@@ -89,13 +89,13 @@ def run_rollout(cfg, idx, agent, seed=None, case_id=None, rep=0, opt=None):
             rec["all_pass"] = env.all_pass()
             rec["weight_vec"] = env.w.tolist()
             messages.append({"role": "user",
-                             "content": render_feedback(fb, turn=turn, max_turns=cfg.max_turns,
-                                                        priority=env.priority)})
+                             "content": render_feedback_for(env, cfg, fb, turn=turn,
+                                                            max_turns=cfg.max_turns)})
         else:                                    # parse error -> tell agent, costs a turn
             messages.append({"role": "user",
                              "content": f"Could not parse an action ({action.error}).\n"
-                             + render_feedback(env.feedback(), turn=turn, max_turns=cfg.max_turns,
-                                               priority=env.priority)})
+                             + render_feedback_for(env, cfg, turn=turn,
+                                                   max_turns=cfg.max_turns)})
 
         io.append_transcript(d, rec)
 

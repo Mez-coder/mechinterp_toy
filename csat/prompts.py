@@ -76,3 +76,18 @@ def render_case_for(env, cfg):
     if kind == "parabola":
         return render_case_parabola(env, cfg.max_turns)
     return render_case(env, cfg.max_turns)
+
+def render_feedback_for(env, cfg, fb=None, *, turn=None, max_turns=None, note=None):
+    """Env-aware per-turn feedback render.
+
+    Suppresses the PRIORITY star/line for the parabola env (single shared margin,
+    no priority) so the in-loop feedback matches the parabola framing instead of
+    silently falling back to coupling language. Mirrors the dispatch used by
+    system_prompt_for / render_case_for so the rollout loop never reads
+    env.priority directly.
+    """
+    fb = env.feedback() if fb is None else fb
+    kind = getattr(cfg, "env_kind", "coupling")
+    priority = None if kind == "parabola" else env.priority
+    return render_feedback(fb, turn=turn, max_turns=max_turns, note=note,
+                           priority=priority)
