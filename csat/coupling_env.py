@@ -64,7 +64,7 @@ class CouplingEnv:
         self.submitted = False
 
     # --- per-case difficulty randomisation (analogue of your sampled limits) ---
-    def reset(self, seed=None, jitter=0.0, priority=None, wide=True):
+    def reset(self, seed=None, jitter=0.0, priority=None, wide=True, w_init=0.5):
         rng = np.random.default_rng(seed)
         n = self.n_obj
         if wide:                                   # independent wide draws -> optima spread
@@ -79,7 +79,9 @@ class CouplingEnv:
         np.fill_diagonal(C, 0.0)
         self.C_case = np.clip(C, 0.0, None)
         self.priority = int(rng.integers(n)) if priority is None else int(priority)
-        self.w = np.zeros(n)
+        self.w = np.full(n, float(w_init)) if w_init is not None else np.zeros(n)
+        if self.grid:                              # keep the start on-grid if discretised
+            self.w = np.round(self.w / self.grid) * self.grid
         self.submitted = False
         return self.feedback()
 
@@ -167,3 +169,9 @@ class CouplingEnv:
                 first = round(float(x), 3); break
         return dict(symmetric_pass_weight=first,
                     margin_at_full_push=self.margins(np.ones(self.n_obj)).round(3).tolist())
+
+    def case_dict(self):
+        return dict(n_obj=self.n_obj, env_kind="coupling", beta=self.beta,
+                    priority=int(self.priority),
+                    m0=self.m0_case.tolist(), G=self.G_case.tolist(),
+                    C=self.C_case.tolist())

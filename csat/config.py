@@ -10,7 +10,7 @@ class Config:
     model_name: str = "Qwen/Qwen3.5-9B"
     device: str = "cuda"
     temperature: float = 0.7
-    max_new_tokens: int = 2048
+    max_new_tokens: int = 4096
     enable_thinking: bool = False
     # --- activation capture (see recorder.py) ---
     capture: bool = True
@@ -21,12 +21,19 @@ class Config:
     out_dir: str = "runs"
     run_name: str = "csat"
     seed_start: int = 0
-    n_rollouts: int = 200          # number of DISTINCT cases (landscapes)
-    repeats_per_case: int = 1      # R: independent rollouts per case (same landscape, fresh sampling)
-    max_turns: int = 50
+    n_rollouts: int = 200         # number of DISTINCT cases (landscapes)
+    repeats_per_case: int = 10     # R: independent rollouts per case (same landscape, fresh sampling)
+    max_turns: int = 30
     # --- env ---
-    # --- env ---
-    n_obj: int = 3
+    # --- env selection ---
+    env_kind: str = "parabola"        # "coupling" | "parabola"
+    # --- parabola env (used when env_kind == "parabola") ---
+    par_a: float = 0.15                 # floor tilt: 0 = flat floor, >0 = gentle central gradient
+    par_b: float = 1.0                  # wall steepness (quartic)
+    par_z_pass_frac: float = 0.4        # pass threshold as fraction of z at the 0.5 start
+
+    ## coupling --
+    n_obj: int = 2
     beta: float = 4.0
     grid: float = 0.0                   # 0 = continuous; 0.1 = snap weights to a 0.1 grid
     case_jitter: float = 0.1             # per-case randomisation of m0/G/C (0 = fixed)

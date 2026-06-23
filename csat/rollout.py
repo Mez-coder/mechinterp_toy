@@ -13,11 +13,20 @@ from .coupling_env import CouplingEnv
 from .prompts import SYSTEM_PROMPT, render_case
 from .dsl import parse_action, render_feedback, split_thinking
 from . import io_utils as io
+from .coupling_env import CouplingEnv
+from .parabola_env import ParabolaEnv      # NEW
+from .prompts import system_prompt_for, render_case_for
 
 def build_env(cfg):
+    kind = getattr(cfg, "env_kind", "coupling")
+    if kind == "parabola":
+        return ParabolaEnv(n_obj=cfg.n_obj,
+                           a=getattr(cfg, "par_a", 0.15),
+                           b=getattr(cfg, "par_b", 1.0),
+                           z_pass_frac=getattr(cfg, "par_z_pass_frac", 0.4),
+                           grid=getattr(cfg, "grid", 0.0))
     return CouplingEnv(n_obj=cfg.n_obj, beta=cfg.beta, m0=cfg.m0, G=cfg.G, C=cfg.C,
                        grid=getattr(cfg, "grid", 0.0))
-
 
 def run_rollout(cfg, idx, agent, seed=None, case_id=None, rep=0, opt=None):
     seed = (cfg.seed_start + idx) if seed is None else int(seed)
@@ -37,9 +46,8 @@ def run_rollout(cfg, idx, agent, seed=None, case_id=None, rep=0, opt=None):
         return (opt['margin_priority'] - snap['margin_priority']) \
             if opt.get('feasible') else None
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": render_case(env, cfg.max_turns)}]
-
+    messages = [{"role": "system", "content": system_prompt_for(cfg)},
+                {"role": "user", "content": render_case_for(env, cfg)}]
     submitted = forced = False
     first_pass_turn = None                       # turn at which all margins first >= 0
 

@@ -36,8 +36,11 @@ def main():
     start = io.next_rollout_idx(cfg.run_dir())
     if start:
         print(f"resuming: {start} completed rollouts found; continuing from idx {start}")
-    seeds = pick_spread_seeds(cfg, n_want=cfg.n_rollouts, build_env=build_env,
-                          seed_start=cfg.seed_start)
+    if cfg.env_kind == "parabola":
+        seeds = list(range(cfg.seed_start, cfg.seed_start + cfg.n_rollouts))
+    else:
+        seeds = pick_spread_seeds(cfg, n_want=cfg.n_rollouts, build_env=build_env,
+                                seed_start=cfg.seed_start)
     R = getattr(cfg, "repeats_per_case", 1)
     for case_id, seed in enumerate(seeds):
         # optimum is a property of the landscape -> compute ONCE per case and reuse,
@@ -52,7 +55,7 @@ def main():
                             case_id=case_id, rep=rep, opt=opt)
             print(f"rollout {idx:04d} (case {case_id:03d} rep {rep}): "
                 f"submitted={r['submitted']} forced={r['forced']} "
-                f"first_pass_turn={r['first_pass_turn']}"))
+                f"first_pass_turn={r['first_pass_turn']}")
 
 
 if __name__ == "__main__":

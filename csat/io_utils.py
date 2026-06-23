@@ -21,11 +21,10 @@ def next_rollout_idx(run_dir):
     return max(idxs) + 1 if idxs else 0
 
 def save_case(d, env, seed):
+    case = dict(seed=int(seed))
+    case.update(env.case_dict())
     with open(os.path.join(d, "case.json"), "w") as f:
-        json.dump(dict(seed=int(seed), n_obj=env.n_obj, beta=env.beta,   # <- already here
-               priority=int(env.priority),
-               m0=env.m0_case.tolist(), G=env.G_case.tolist(),
-               C=env.C_case.tolist()), f, indent=2)
+        json.dump(case, f, indent=2)
     open(os.path.join(d, "transcript.jsonl"), "w").close()   # fresh log per (re)run
 
 
