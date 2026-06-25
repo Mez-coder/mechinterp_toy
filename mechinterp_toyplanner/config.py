@@ -19,16 +19,17 @@ class RunConfig:
     nx: int = 150
     ny: int = 150
     voxel_mm: float = 2.0
-    n_energy_layers: int = 24
+    n_energy_layers: int = 30
     spot_half_extent_mm: float = 60.0
     cache_dir: str = "cache"
 
     # ---- difficulty knobs -------------------------------------------------
     n_oar: Optional[int] = 4        # fixed OAR count; None = random 2-4
     oar_overlap_bias: float = 0.0      # 0 = spread; ->1 pulls OARs onto the CTV
-    cov_tol_pct: float = 1.0           # coverage you may trade for sparing (smaller = harder)
-    constraint_sigma_frac: float = 0.1 # spread of sampled OAR limit (fraction of baseline)
-    constraint_tighten_frac: float = 0.1  # mean shift of limit BELOW baseline (the difficulty dial)
+    ctv_d2_limit_pct: float = 110          # hot spot metric
+    ctv_d98_limit_pct: float = 93          # hot spot metric
+    constraint_sigma_frac: float = 0.5 # spread of sampled OAR limit (fraction of baseline)
+    constraint_tighten_frac: float = 0.5  # mean shift of limit BELOW baseline (the difficulty dial)
 
     # model (ignored in --human mode)
     model_name: str = "Qwen/Qwen3.5-9B"

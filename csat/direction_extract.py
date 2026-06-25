@@ -241,6 +241,7 @@ def main():
     ap.add_argument("--layers", choices=["even", "all"], default="even")
     ap.add_argument("--include-embed", action="store_true",
                     help="keep hidden-state index 0 (embeddings) in the selection")
+    
     ap.add_argument("--select", choices=["separation", "ratio", "abs"],
                     default="separation",
                     help="how to pick the best layer: 'separation' (default; "

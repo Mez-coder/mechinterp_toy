@@ -21,7 +21,7 @@ At the end of each turn you take exactly ONE action (SET or SUBMIT):
 
 FOR EXAMPLE: 'OAR1 is a little high ... CTV2 is too high ... [SET OAR1=5.5, CTV2=10, ...]'
 
-Your goal: get every OAR at or below its limit while keeping the tumour covered (d98 > limit and d2 < limit). \
+Your goal: Minimise the OAR doses to be as low as possible (certainly lower than the limits) whilst keeping the tumour covered as much as possible (d98 > limit and d2 < limit). \
 Submit once you are satisfied with the plan."""
 
 

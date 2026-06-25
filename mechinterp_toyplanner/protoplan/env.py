@@ -28,11 +28,14 @@ OAR_METRICS = ['D2%', 'D5%', 'D20%', 'D50%', 'mean']
 
 class PlanningEnv:
     def __init__(self, Rx=50.4, geom: Geometry2D | None = None,
-                 slice_thickness_mm=2.0, cov_tol_pct=0.0,
+                 slice_thickness_mm=2.0, ctv_d2_limit_pct = 110, ctv_d98_limit_pct = 95,
                  constraint_sigma_frac=0.0, constraint_tighten_frac=0.0,
                  n_oar=None, oar_overlap_bias=0.0, **geom_kwargs):
         self.Rx = Rx
-        self.cov_tol_pct = cov_tol_pct
+        self.ctv_d2_limit_pct = ctv_d2_limit_pct
+        self.ctv_d98_limit_pct = ctv_d98_limit_pct
+        self.ctv_d98_acc =(ctv_d98_limit_pct / 100.0) * Rx
+        self.ctv_d2_acc  = (ctv_d2_limit_pct / 100.0) * Rx   # ctv_d2_limit_pct ~ 110
         self.constraint_sigma_frac = constraint_sigma_frac
         self.constraint_tighten_frac = constraint_tighten_frac
         self.n_oar = n_oar
@@ -65,10 +68,10 @@ class PlanningEnv:
         # dose level honestly; high OAR weights now genuinely trade against coverage.
 
     def _coverage_ok(self):
-        """CTV coverage acceptance: not worse than baseline by more than cov_tol."""
+        """CTV coverage acceptance: not worse than baseline."""
         d98 = dvh.D_percent(self.dose, self._mask('CTV'), 98)
         d2 = dvh.D_percent(self.dose, self._mask('CTV'), 2)
-        return d98 >= self.ctv_floor['D98_gy'] and d2 <= self.ctv_floor['D2_gy']
+        return d98 >= self.ctv_d98_acc and d2 <= self.ctv_d2_acc
 
     def _oar_value(self, name, metric):
         return dvh.evaluate_metric(metric, self.dose, self._mask(name), self.Rx, self.voxel_cc)
@@ -83,8 +86,8 @@ class PlanningEnv:
                              oar_val={n: self._oar_value(n, m) for n, m in self.oar_metric.items()})
         d98 = dvh.D_percent(self.dose, self._mask('CTV'), 98)
         d2 = dvh.D_percent(self.dose, self._mask('CTV'), 2)
-        tol = self.cov_tol_pct / 100 * self.Rx
-        self.ctv_floor = dict(D98_gy=d98 - tol, D2_gy=d2 + tol, D98_base=d98, D2_base=d2)
+       
+        self.ctv_floor = dict(D98_gy=d98 , D2_gy=d2, D98_base=d98, D2_base=d2)
 
     def _sample_constraint(self, baseline_val, rng):
         # mean shifted below baseline by constraint_tighten_frac (difficulty),
@@ -103,9 +106,10 @@ class PlanningEnv:
         self.struct_idx = {k: np.flatnonzero(m.ravel()) for k, m in self.structures.items()}
 
         self.objectives = [
-            {"structure": "CTV", "metric": "D2%",  "direction": "upper", "limit": 107, "weight": 1},
-            {"structure": "CTV", "metric": "D98%", "direction": "lower", "limit": 95, "weight": 1},
+            {"structure":"CTV","metric":"D2%","direction":"upper","limit": self.ctv_d2_limit_pct,"weight":1},
+            {"structure":"CTV","metric":"D98%","direction":"lower","limit": self.ctv_d98_limit_pct,"weight":1},
         ]
+
         self.oar_metric = {}
         for name in self.structures:
             if name.startswith('OAR'):
@@ -153,9 +157,9 @@ class PlanningEnv:
             if o['structure'] == 'CTV':
                 # report coverage against the acceptance floor, not the optimiser push-target
                 if o['metric'] == 'D98%':
-                    lim, ok = self.ctv_floor['D98_gy'], val >= self.ctv_floor['D98_gy']
+                    lim, ok = self.ctv_d98_acc, val >= self.ctv_d98_acc
                 else:
-                    lim, ok = self.ctv_floor['D2_gy'], val <= self.ctv_floor['D2_gy']
+                    lim, ok = self.ctv_d2_acc,  val <= self.ctv_d2_acc
             else:
                 lim = objmod.dose_limit_gy(o, self.Rx)
                 ok = (val <= lim) if o['direction'] == 'upper' else (val >= lim)

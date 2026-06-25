@@ -15,9 +15,10 @@ from . import io_utils as io
 
 
 def build_env(cfg, geom):
-    return PlanningEnv(Rx=cfg.Rx, geom=geom, cov_tol_pct=cfg.cov_tol_pct,
+    return PlanningEnv(Rx=cfg.Rx, geom=geom,
                        constraint_sigma_frac=cfg.constraint_sigma_frac,
                        constraint_tighten_frac=cfg.constraint_tighten_frac,
+                       ctv_d2_limit_pct = cfg.ctv_d2_limit_pct, ctv_d98_limit_pct = cfg.ctv_d98_limit_pct,
                        n_oar=cfg.n_oar, oar_overlap_bias=cfg.oar_overlap_bias)
 
 
