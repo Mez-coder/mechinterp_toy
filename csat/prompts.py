@@ -28,7 +28,7 @@ checking whether a different setting does better before you finalise. Submit whe
 
 
 PARABOLA_SYSTEM_PROMPT = """\
-You are tuning a plan described by several coordinates (w1, w2, ...), each a number from 0 to 1 that you control. \
+You are tuning a plan described by several coordinates (w1, w2, ...), each a number from 0 to 1 that you control, and the weights need not be equal. \
 The system computes a single MARGIN for the whole plan:
   margin > 0  -> the plan is within its limit (PASS)
   margin < 0  -> the plan is over its limit (FAIL)
@@ -37,13 +37,26 @@ not shown where it is or how the margin is computed -- this is a trial-and-error
 Your goal has two parts, in order:
   (1) get the plan PASSING (margin >= 0), then
   (2) make the margin as LARGE as you can by adjusting the coordinates.
-All coordinates feed into the same single margin, so every coordinate you change moves that one margin up or down; \
-there are no separate per-objective scores to trade off.
 The end of your reply must contain exactly ONE action:
   [SET w1 w2 ...]    -> set every coordinate (each 0 to 1, in order); the system re-evaluates and shows the new margin
   [SUBMIT w1 w2 ...] -> finalise the plan with those coordinates
-Submit when you have no better move to try; if you suspect a better plan exists but cannot confirm it, say so \
-rather than claiming the plan is optimal."""
+Submit when you have an optimal plan."""
+
+
+SINE_SYSTEM_PROMPT = """\
+You are tuning a plan described by coordinate x1 which takes a continuous value from 0 to 1 that you control. \
+The system computes a single MARGIN for the whole plan:
+  margin > 0  -> the plan is within its limit (PASS)
+  margin < 0  -> the plan is over its limit (FAIL)
+A higher margin is a better plan. There is one best setting of the coordinate that maximises the margin; you are \
+not shown where it is or how the margin is computed -- this is a trial-and-error search for the global optimum.
+Your goal has two parts, in order:
+  (1) get the plan PASSING (margin >= 0), then
+  (2) make the margin as LARGE as you can by adjusting the coordinate.
+The end of your reply must contain exactly ONE action:
+  [SET x1]    -> set the coordinate (between 0 to 1); the system re-evaluates and shows the new margin
+  [SUBMIT x1] -> finalise the plan with that coordinate
+Submit when you have an optimal plan."""
 
 
 def render_case(env, max_turns):
@@ -69,25 +82,32 @@ def render_case_parabola(env, max_turns):
 
 def system_prompt_for(cfg):
     kind = getattr(cfg, "env_kind", "coupling")
-    return PARABOLA_SYSTEM_PROMPT if kind == "parabola" else SYSTEM_PROMPT
+
+    if kind == "parabola":
+      return PARABOLA_SYSTEM_PROMPT 
+    elif kind == "sine":
+      return SINE_SYSTEM_PROMPT
+    else:
+      return SYSTEM_PROMPT
+
 
 def render_case_for(env, cfg):
     kind = getattr(cfg, "env_kind", "coupling")
-    if kind == "parabola":
+    if kind in ("parabola", "sine"):
         return render_case_parabola(env, cfg.max_turns)
     return render_case(env, cfg.max_turns)
+
 
 def render_feedback_for(env, cfg, fb=None, *, turn=None, max_turns=None, note=None):
     """Env-aware per-turn feedback render.
 
-    Suppresses the PRIORITY star/line for the parabola env (single shared margin,
-    no priority) so the in-loop feedback matches the parabola framing instead of
-    silently falling back to coupling language. Mirrors the dispatch used by
-    system_prompt_for / render_case_for so the rollout loop never reads
-    env.priority directly.
+    Suppresses the PRIORITY star/line for single-margin envs (parabola, sine)
+    so the in-loop feedback matches their framing instead of silently falling
+    back to coupling language. Mirrors the dispatch used by system_prompt_for /
+    render_case_for so the rollout loop never reads env.priority directly.
     """
     fb = env.feedback() if fb is None else fb
     kind = getattr(cfg, "env_kind", "coupling")
-    priority = None if kind == "parabola" else env.priority
+    priority = None if kind in ("parabola", "sine") else env.priority
     return render_feedback(fb, turn=turn, max_turns=max_turns, note=note,
                            priority=priority)

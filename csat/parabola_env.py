@@ -74,11 +74,12 @@ class ParabolaEnv:
     def all_pass(self, w=None):
         return bool(self.margins(w)[0] >= 0)
 
+    
+
     def feedback(self):
         m = float(self.margins()[0])
-        # one row per coordinate (weights are the coords); margin is shared/global
-        return [dict(obj=i, weight=round(float(self.w[i]), 3),
-                     margin=round(m, 3), ok=bool(m >= 0))
+        return [dict(obj=i, weight=round(float(self.w[i]), 6),
+                    margin=round(m, 6), ok=bool(m >= 0))
                 for i in range(self.n_obj)]
 
     def submit(self):

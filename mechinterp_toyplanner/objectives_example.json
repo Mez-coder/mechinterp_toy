@@ -1,0 +1,10 @@
+{
+  "_schema": "metric = {D|V}{number}{unit}. D{p}% = dose to p% of structure; D{v}cc = dose to hottest v cc; V{d}Gy = % volume >= d Gy. direction: upper|lower. For D-metrics limit is % of prescription; for V-metrics limit is % volume. weight 0-100 (0 = inactive, agent-controlled). CTV mean is normalised to Rx automatically.",
+  "objectives": [
+    {"structure": "CTV",  "metric": "D2%",  "direction": "upper", "limit": 107, "weight": 100},
+    {"structure": "CTV",  "metric": "D98%", "direction": "lower", "limit": 95,  "weight": 100},
+    {"structure": "OAR1", "metric": "D2%",  "direction": "upper", "limit": 60,  "weight": 0},
+    {"structure": "OAR2", "metric": "D2%",  "direction": "upper", "limit": 60,  "weight": 0},
+    {"structure": "OAR3", "metric": "D2%",  "direction": "upper", "limit": 60,  "weight": 0}
+  ]
+}

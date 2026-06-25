@@ -96,7 +96,8 @@ def render_feedback(rows, turn=None, max_turns=None, note=None, priority=None):
         n_pass += int(r['ok'])
         status = 'PASS' if r['ok'] else 'FAIL'
         star = ' *' if (priority is not None and r['obj'] == priority) else ''
-        lines.append(f"O{r['obj'] + 1:<4d} {r['weight']:7.3f} {r['margin']:+8.3f}  {status}{star}")
+        
+        lines.append(f"O{r['obj'] + 1:<4d} {r['weight']:9.6f} {r['margin']:+10.6f}  {status}{star}")
     lines.append(f"objectives passing: {n_pass}/{n}  (margin>0 = under limit)")
     if priority is not None:
         lines.append(f"PRIORITY = O{priority + 1} (*): keep EVERY objective passing, "

@@ -36,7 +36,7 @@ def main():
     start = io.next_rollout_idx(cfg.run_dir())
     if start:
         print(f"resuming: {start} completed rollouts found; continuing from idx {start}")
-    if cfg.env_kind == "parabola":
+    if cfg.env_kind in ["parabola", "sine"]:
         seeds = list(range(cfg.seed_start, cfg.seed_start + cfg.n_rollouts))
     else:
         seeds = pick_spread_seeds(cfg, n_want=cfg.n_rollouts, build_env=build_env,

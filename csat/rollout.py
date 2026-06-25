@@ -19,14 +19,20 @@ from .prompts import system_prompt_for, render_case_for, render_feedback_for
 
 def build_env(cfg):
     kind = getattr(cfg, "env_kind", "coupling")
+    if kind == "sine":
+        from .sine_env import Sine1DEnv
+        return Sine1DEnv(z_pass_frac=getattr(cfg, "sine_z_pass_frac", 0.4),
+                         grid=getattr(cfg, "grid", 0.0))
     if kind == "parabola":
         return ParabolaEnv(n_obj=cfg.n_obj,
                            a=getattr(cfg, "par_a", 0.15),
                            b=getattr(cfg, "par_b", 1.0),
                            z_pass_frac=getattr(cfg, "par_z_pass_frac", 0.4),
                            grid=getattr(cfg, "grid", 0.0))
-    return CouplingEnv(n_obj=cfg.n_obj, beta=cfg.beta, m0=cfg.m0, G=cfg.G, C=cfg.C,
-                       grid=getattr(cfg, "grid", 0.0))
+    if kind == "coupling":
+        return CouplingEnv(n_obj=cfg.n_obj, beta=cfg.beta, m0=cfg.m0, G=cfg.G, C=cfg.C,
+                           grid=getattr(cfg, "grid", 0.0))
+    raise ValueError(f"unknown env_kind {kind!r} (expected sine|parabola|coupling)")
 
 def run_rollout(cfg, idx, agent, seed=None, case_id=None, rep=0, opt=None):
     seed = (cfg.seed_start + idx) if seed is None else int(seed)
