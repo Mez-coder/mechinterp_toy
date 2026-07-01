@@ -82,16 +82,29 @@ def _positions(tokens, prompt_len, seq, last_k):
 
 
 def capture_and_save(model, full_ids, prompt_len, path, tokens="lastk",
-                     dtype="float16", last_k=30):
+                     dtype="bfloat16", last_k=30):
+    """Re-forward the full (text-only) sequence once with output_hidden_states and
+    save the residual stream at the selected positions across ALL layers -- the
+    same approach used in the source environments.
+
+    A single post-generation forward (NOT output_hidden_states during generate)
+    means memory is bounded by sequence length, not by the generation, so it does
+    not OOM. With images removed there is no vision/3D-RoPE path, so the plain
+    forward is valid. The only addition vs the original is moving each layer's
+    captured slice to CPU before stacking, so it also works when device_map='auto'
+    shards layers across multiple GPUs (a single-GPU run never needed this).
+    """
     import torch
     with torch.no_grad():
-        out = model(full_ids, output_hidden_states=True, use_cache=False)
-    hs = out.hidden_states                      # tuple (L+1) of (1, seq, d_model)
+        out = model(input_ids=full_ids, output_hidden_states=True, use_cache=False)
+    hs = out.hidden_states                      # tuple (L+1) of (1, seq, d); per-device
     seq = full_ids.shape[1]
     positions = _positions(tokens, prompt_len, seq, last_k)
-    idx = torch.tensor(positions, device=hs[0].device)
-    stack = torch.stack([h[0].index_select(0, idx) for h in hs])   # (L+1, n_pos, d)
-    acts = stack.to(torch.float32).cpu().numpy()                   # bf16 -> f32 (lossless)
+    pos = torch.tensor(positions)
+    # index each layer on its OWN device (small (k,d) slice), then pull to CPU and
+    # stack there -> no cross-device stack error under multi-GPU sharding.
+    rows = [h[0].index_select(0, pos.to(h.device)).to(torch.float32).cpu() for h in hs]
+    acts = torch.stack(rows).numpy()            # (L+1, n_pos, d) float32
     np.savez_compressed(
         path,
         acts=_to_storage(acts, dtype),

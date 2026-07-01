@@ -47,14 +47,42 @@ thereafter) plus a DVH table, and emits one action:
   target D98 around ~92–94 %; the default `d98_floor_pct=92` reflects that and
   is a config knob.
 
-## MI harness
+## MI harness (cross-environment steering)
+This env **reuses the steering vector already extracted from the parabola env** —
+it never rebuilds one. The vector is loaded from the source `directions.npz`
+(`set_all`/`submit_all` per layer) and, at use time, `build_steering_vector(layer,
+directions, source_run_dir, frac)` forms `submit−set`, unit-normalises, and scales
+to `frac × source mean-token-norm` (default layer 22, frac 0.4) — identical to the
+1D/story transfer studies.
+
 * `recorder.py` — capture residual stream at the last **k=30** decision tokens,
-  all layers, lossless bf16 storage.
-* `steering.py` — `build_steering_vector` = mean(SUBMIT decision residual) −
-  mean(SET decision residual) per layer; `steering_active(model, block_idx, vec,
-  alpha)` forward-hook (same signature as the 1D/story studies).
-* `replay.py` — counterfactual branch: roll back to the SUBMIT turn, drop it,
-  re-generate under −alpha·v ("keep optimising") / +alpha·v ("stop").
+  all layers, lossless bf16. For the VLM it re-forwards **with `pixel_values`** so
+  image-placeholder tokens get their embeddings (a text-only re-forward would
+  corrupt the capture).
+* `steering.py` — `load_direction`, `mean_token_norm_at_layer`,
+  `build_steering_vector`, `find_decoder_layers` (auto-locates the decoder
+  `ModuleList` — robust to VLM/MoE/nested decoders; `layers_attr` override), and
+  `steering_active(model, block_idx, vec, alpha, layers_attr)`. `block_idx =
+  layer − 1`; `alpha>0` → toward SUBMIT (stop), `alpha<0` → toward SET (keep going).
+* `replay.py` — counterfactual branch at the SUBMIT turn under the source vector.
+* `transfer.py` — the cross-env study: `--study composite` (branch at SUBMIT
+  across an alpha sweep, plot satisficing-margin trajectories) and `--study
+  project` (unsteered proton rollouts → project each turn's activations onto the
+  source SUBMIT−SET axis; does the proton env climb the parabola axis?).
+
+### Model / architecture notes
+* Default model is `Qwen/Qwen3.5-9B` (a vision-language model — each turn is shown
+  the dose-wash image). If the decoder stack is nested under a VL wrapper or is
+  MoE, `find_decoder_layers` still finds it (longest decoder-block `ModuleList`);
+  if auto-detect picks wrong, pass `--layers-attr model.language_model.layers`.
+* Image handling uses the unified chat-template path; if the Qwen processor needs
+  it, it falls back to `qwen_vl_utils.process_vision_info`.
+* **Cross-env magnitude caveat:** the steering magnitude is calibrated to the
+  *source* token-norm. Proton prompts carry image tokens and longer context, so
+  the proton residual scale may differ; if a sweep looks too weak/strong, that's
+  the place to look (you can recalibrate `frac`, or estimate the proton env's own
+  token-norm — but the default keeps the vector identical to the source for a
+  clean transfer claim).
 
 ## Usage
 ```bash
@@ -64,9 +92,15 @@ python -m protontherapy.run --run-name r0 --n-rollouts 100
 # debug the loop with no model
 python -m protontherapy.run --scripted "[SET 30=1,120=1,210=0.7,300=1]" "[SUBMIT]"
 
-# build the steering vector, then branch under it
-python -m protontherapy.run --build-vector --run-name r0
-python -m protontherapy.run --replay runs/r0/rollout_0000 --layer 18 --alpha -1.0 --run-name r0
+# cross-env steering study (source vector from the parabola run)
+python -m protontherapy.transfer --study composite --source-run-dir runs/csat \
+    --layer 22 --alphas -1.0 -0.5 0.0 0.5 1.0 --n-rollouts 12
+python -m protontherapy.transfer --study project --source-run-dir runs/csat \
+    --layer 22 --n-rollouts 12
+
+# single counterfactual branch
+python -m protontherapy.run --replay runs/r0/rollout_0000 \
+    --source-run-dir runs/csat --layer 22 --alpha -1.0
 ```
 
 ## Files
@@ -75,6 +109,6 @@ Bethe-Bloch + range table · `tracer.py` ray-trace influence builder ·
 `optimize.py` SFO/MFO solver · `dvh.py` metrics · `render.py` images ·
 `env.py` environment · `dsl.py` action parser · `prompts.py` ·
 `agents.py` (Human/Scripted/Model) · `recorder.py` · `steering.py` ·
-`replay.py` · `rollout.py` · `run.py` · `config.py`.
+`replay.py` · `transfer.py` · `rollout.py` · `run.py` · `config.py`.
 
 Defaults: 150×150 grid @ 2 mm, phantom R=150 mm, ≤4 beams, SFO, k=30.

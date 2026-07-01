@@ -25,7 +25,11 @@ from .tracer import BeamTracer
 from .optimize import PlanOptimiser, combine
 from . import dvh, render
 
-OAR_METRICS = ['D20%', 'D50%']
+# Every OAR is judged by its HOTSPOT (Dmax). Coverage is angle-independent in a
+# pure-water phantom and guaranteed uniform by the SFO solve, so it is assumed
+# (not shown, not scored): the only objective is to push OAR hotspots down.
+OAR_METRIC = 'hotspot'
+DISPLAY_SCALE = 100.0          # report doses as % of Rx (0-100), not 0-1
 
 
 class PlanningEnv:
@@ -67,8 +71,10 @@ class PlanningEnv:
         self.target_mask = self.structures['CTV']
         self._cache.clear()
 
-        self.oar_metric = {n: str(rng.choice(OAR_METRICS))
+        self.oar_metric = {n: OAR_METRIC
                            for n in self.structures if n.startswith('OAR')}
+        self.oar_color = {n: render.oar_color(int(n[3:]))[0]
+                          for n in self.oar_metric}          # name -> colour word
         self._baseline_limits()                # uniform-plan-anchored OAR limits
 
         self.angles = []          # current plan (gantry degrees)
@@ -125,28 +131,27 @@ class PlanningEnv:
 
     # ------------------------------------------------------------- evaluation
     def _coverage(self):
+        """Internal logging only -- NOT shown to the model and NOT scored.
+        Coverage is assumed (SFO gives uniform target dose at any angle set)."""
         d98 = dvh.D_percent(self.dose, self.target_flat, 98)
         d2 = dvh.D_percent(self.dose, self.target_flat, 2)
         return d98, d2, (d98 >= self.d98_acc and d2 <= self.d2_acc)
 
     def get_feedback(self):
+        """Model-facing metrics: OAR hotspots only. Values are raw (Rx units);
+        the display layer scales them to % of Rx."""
         rows = []
-        d98, d2, cov_ok = self._coverage()
-        rows.append(dict(structure='CTV', metric='D98%', value=round(d98, 3),
-                         limit=round(self.d98_acc, 3), ok=bool(d98 >= self.d98_acc),
-                         kind='lower'))
-        rows.append(dict(structure='CTV', metric='D2%', value=round(d2, 3),
-                         limit=round(self.d2_acc, 3), ok=bool(d2 <= self.d2_acc),
-                         kind='upper'))
         for n, m in self.oar_metric.items():
             val = dvh.evaluate_metric(m, self.dose, self._flat(n), self.Rx)
             lim = self.oar_limit[n]
-            rows.append(dict(structure=n, metric=m, value=round(val, 3),
-                             limit=round(lim, 3), ok=bool(val <= lim), kind='upper'))
+            rows.append(dict(structure=n, metric='hotspot', value=round(val, 4),
+                             limit=round(lim, 4), ok=bool(val <= lim),
+                             kind='upper', color=self.oar_color[n]))
         return rows
 
     def plan_passes(self):
-        return all(r['ok'] for r in self.get_feedback())
+        rows = self.get_feedback()
+        return all(r['ok'] for r in rows) if rows else True
 
     # ------------------------------------------------------------- rendering
     def render_phantom(self, path):

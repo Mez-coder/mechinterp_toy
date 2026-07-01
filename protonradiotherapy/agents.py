@@ -54,27 +54,28 @@ class ModelAgent:
         self.processor = AutoProcessor.from_pretrained(cfg.model_name)
         self.model.eval()
 
-    # -- assemble multimodal chat inputs (image per user turn) --------------
+    # -- assemble TEXT-ONLY chat inputs (no images: fair to the text source
+    #    envs, faster, and avoids the VLM 3D-RoPE machinery entirely) ---------
     def _build_inputs(self, messages):
-        from PIL import Image
         msgs, sys_txt = [], None
         for m in messages:
             if m["role"] == "system":
                 sys_txt = m["content"]; continue
-            content = []
             text = m["content"]
             if sys_txt and m["role"] == "user":
-                text = sys_txt + "\n\n" + text
-                sys_txt = None
-            if m.get("image_path") and m["role"] == "user":
-                content.append({"type": "image",
-                                "image": Image.open(m["image_path"]).convert("RGB")})
-            content.append({"type": "text", "text": text})
-            msgs.append({"role": m["role"], "content": content})
-        inputs = self.processor.apply_chat_template(
-            msgs, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt")
-        return {k: v.to(self.model.device) for k, v in inputs.items()}
+                text = sys_txt + "\n\n" + text; sys_txt = None
+            msgs.append({"role": m["role"], "content": text})
+        try:
+            inputs = self.processor.apply_chat_template(
+                msgs, tokenize=True, add_generation_prompt=True,
+                return_dict=True, return_tensors="pt",
+                enable_thinking=getattr(self.cfg, "enable_thinking", False))
+        except TypeError:
+            inputs = self.processor.apply_chat_template(
+                msgs, tokenize=True, add_generation_prompt=True,
+                return_dict=True, return_tensors="pt")
+        dev = self.model.get_input_embeddings().weight.device   # sharded-model safe
+        return {k: v.to(dev) for k, v in inputs.items()}
 
     def _action_stopper(self, prompt_len):
         from transformers import StoppingCriteria, StoppingCriteriaList
@@ -115,9 +116,10 @@ class ModelAgent:
                 "resp_len": int(full.shape[1] - prompt_len),
                 "temperature": self.cfg.temperature}
         if capture_path and self.cfg.capture:
+            # exactly the source-env capture: one post-generation re-forward,
+            # take the last-k positions across all layers. Text-only -> no 3D-RoPE
+            # path; single forward -> no OOM; capture_and_save handles multi-GPU.
             from .recorder import capture_and_save
-            # re-forward WITHOUT images for a clean text-residual capture is not
-            # possible for a VLM; capture the full multimodal forward instead.
             capture_and_save(self.model, full, prompt_len, capture_path,
                              tokens=self.cfg.capture_tokens,
                              last_k=self.cfg.capture_last_k,

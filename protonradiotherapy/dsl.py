@@ -72,24 +72,25 @@ def parse_action(text: str) -> Action:
 
 
 def render_feedback(rows, angles=None, weights=None, turn=None, max_turns=None,
-                    note=None, passes=None) -> str:
-    """Plain-text DVH table the model sees after each SET."""
+                    note=None, passes=None, scale=100.0) -> str:
+    """Plain-text OAR table the model sees after each SET. Doses are shown as
+    % of Rx (scale=100). Coverage is assumed and not shown -- the only objective
+    is to push every OAR hotspot as far below its limit as possible."""
     lines = []
     if turn is not None:
         lines.append(f"[turn {turn}/{max_turns}]")
     if angles is not None:
         beams = ", ".join(f"{a:.0f}deg(w={w:.2f})" for a, w in zip(angles, weights))
         lines.append(f"beams: {beams if beams else '(none)'}")
-    lines.append(f"{'structure':9s} {'metric':6s} {'value':>7s} {'limit':>7s}  status")
+    lines.append("OAR hotspot doses (% of Rx) -- push these as LOW as you can:")
+    lines.append(f"{'OAR':16s} {'hotspot':>8s} {'limit':>8s}  status")
     for r in rows:
-        if r['structure'] == 'CTV':
-            status = 'OK' if r['ok'] else ('cold!' if r['metric'] == 'D98%' else 'hot!')
-        else:
-            status = 'OK' if r['ok'] else 'OVER'
-        lines.append(f"{r['structure']:9s} {r['metric']:6s} {r['value']:7.3f} "
-                     f"{r['limit']:7.3f}  {status}")
+        label = f"{r['structure']} ({r.get('color','?')})"
+        status = 'OK' if r['ok'] else 'OVER LIMIT'
+        lines.append(f"{label:16s} {r['value']*scale:8.2f} "
+                     f"{r['limit']*scale:8.2f}  {status}")
     if passes is not None:
-        lines.append(f"PLAN STATUS: {'PASS' if passes else 'FAIL'}")
+        lines.append(f"PLAN STATUS: {'all OARs within limits' if passes else 'an OAR is OVER its limit'}")
     if note:
         lines.append(note)
     lines.append("Action -> [SET angle=weight, ...]  |  [SUBMIT]")

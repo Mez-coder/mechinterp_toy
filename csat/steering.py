@@ -106,6 +106,37 @@ def build_steering_vector(layer, directions_path, run_dir, frac=0.4):
 
 
 # --------------------------------------------------------------------------- #
+# compare two direction files (e.g. explore vs set) -- pure numpy, no model
+# --------------------------------------------------------------------------- #
+def _cos2(a, b):
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return float("nan")
+    return float(np.dot(a, b) / (na * nb))
+
+
+def compare_directions(new_path, old_path, layers=None):
+    """Per-layer cosine between the (SUBMIT_all - SET_all) steering AXIS of two
+    directions files (e.g. directions_explore.npz vs directions.npz). Cosine is
+    scale-invariant, so we compare the raw difference vectors -- frac/token-norm
+    scaling is irrelevant. Returns [(layer, cos), ...] over layers present in BOTH
+    files. A cos near +1 means the relabel barely moved the axis; near 0 means it
+    is essentially a new direction."""
+    zn = np.load(new_path, allow_pickle=True)
+    zo = np.load(old_path, allow_pickle=True)
+    ln = list(np.asarray(zn["layers"]).astype(int))
+    lo = list(np.asarray(zo["layers"]).astype(int))
+    want = ln if layers is None else list(layers)
+    out = []
+    for L in want:
+        if L in ln and L in lo:
+            dn = zn["submit_all"][ln.index(L)] - zn["set_all"][ln.index(L)]
+            do = zo["submit_all"][lo.index(L)] - zo["set_all"][lo.index(L)]
+            out.append((int(L), _cos2(dn, do)))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # locating the decoder stack + the steering hook
 # --------------------------------------------------------------------------- #
 def find_decoder_layers(model, override=None):
@@ -163,6 +194,108 @@ def steering_active(model, block_idx, steer_vec, alpha, layers_attr=None):
 
 
 # --------------------------------------------------------------------------- #
+# closed-loop controller: monitor a projection, inject when it crosses a threshold
+# --------------------------------------------------------------------------- #
+class TriggerController:
+    """Monitor the AFFINE projection (SET=-1, SUBMIT=+1) of the last-k mean-pooled
+    residual at block_idx's output onto the DETECT axis; when it crosses steer_proj
+    inject alpha*steer_vec at the same point for steer_k tokens, then stop (re-arms
+    immediately). Detection reads the natural (pre-injection) residual every decode
+    token, so the controller reacts to the model drifting toward SUBMIT, not to its
+    own nudge.
+
+    Context manager (installs one forward hook). Call reset_turn() before each
+    generation and pop_turn() after to collect that turn's record."""
+
+    def __init__(self, model, block_idx, detect_set, detect_sub, steer_vec, alpha,
+                 steer_proj, k, steer_k, trigger="above", layers_attr=None):
+        from collections import deque
+        self._deque = deque
+        layers = find_decoder_layers(model, layers_attr)
+        if not (0 <= block_idx < len(layers)):
+            raise SystemExit(f"block_idx {block_idx} out of range (0..{len(layers)-1}).")
+        self.block = layers[block_idx]
+        dset = np.asarray(detect_set, np.float32); dsub = np.asarray(detect_sub, np.float32)
+        # keep as numpy; build device-local tensors lazily in the hook so this works
+        # when device_map splits the model across GPUs (the residual at this block may
+        # live on a different device than model.parameters()[0]).
+        self._d_np = (dsub - dset).astype(np.float32)
+        self._mid_np = ((dset + dsub) / 2.0).astype(np.float32)
+        self._add_np = (alpha * np.asarray(steer_vec, np.float32)).astype(np.float32)
+        self.denom = float(self._d_np @ self._d_np) + 1e-12
+        self._cache = {}                               # device -> (d, mid, add) tensors
+        self.steer_proj = float(steer_proj); self.k = int(k)
+        self.steer_k = int(steer_k); self.trigger = trigger
+        self.handle = None
+        self.reset_turn()
+
+    def _tensors_for(self, device):
+        t = self._cache.get(device)
+        if t is None:
+            import torch
+            t = (torch.tensor(self._d_np, dtype=torch.float32, device=device),
+                 torch.tensor(self._mid_np, dtype=torch.float32, device=device),
+                 torch.tensor(self._add_np, dtype=torch.float32, device=device))
+            self._cache[device] = t
+        return t
+
+    def reset_turn(self):
+        self.buf = self._deque(maxlen=self.k)
+        self.counter = 0; self.tok_i = 0; self.n_steered = 0
+        self.proj_trace = []; self.triggers = []
+
+    def pop_turn(self):
+        projs = [p for (_i, p, _s) in self.proj_trace if p is not None]
+        return dict(proj_end=(projs[-1] if projs else None),
+                    proj_max=(max(projs) if projs else None),
+                    proj_min=(min(projs) if projs else None),
+                    n_steered=int(self.n_steered), n_triggers=len(self.triggers),
+                    fired=bool(self.triggers), n_tokens=int(self.tok_i),
+                    triggers=list(self.triggers), trace=list(self.proj_trace))
+
+    def __enter__(self):
+        self.handle = self.block.register_forward_hook(self._hook)
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle:
+            self.handle.remove(); self.handle = None
+
+    def _hook(self, _module, _inputs, output):
+        import torch
+        is_tuple = isinstance(output, tuple)
+        hs = output[0] if is_tuple else output
+        if hs.dim() != 3 or hs.shape[1] != 1:          # act only on single-token decode
+            return output
+        res = hs[0, -1, :].detach().to(torch.float32)  # natural (pre-injection) residual
+        self.buf.append(res)
+        d, mid, add = self._tensors_for(res.device)    # tensors on the residual's device
+        proj = None
+        if len(self.buf) >= self.k:                    # full window before firing
+            pooled = torch.stack(tuple(self.buf)).mean(0)
+            proj = float((((pooled - mid) @ d) / self.denom).item())
+        steering_now = False
+        if self.counter > 0:                           # mid-injection
+            steering_now = True
+        elif proj is not None and (
+                (proj > self.steer_proj) if self.trigger == "above"
+                else (proj < self.steer_proj)):        # trigger (re-arms each token)
+            self.counter = self.steer_k
+            self.triggers.append(self.tok_i)
+            steering_now = True
+        if steering_now and self.steer_k > 0:
+            hs = hs.clone()
+            hs[0, -1, :] = hs[0, -1, :] + add.to(hs.dtype)
+            self.counter -= 1
+            self.n_steered += 1
+        self.proj_trace.append((self.tok_i, proj, steering_now))
+        self.tok_i += 1
+        if is_tuple:
+            return (hs,) + tuple(output[1:])
+        return hs
+
+
+# --------------------------------------------------------------------------- #
 # parabola pipeline, steered, for one alpha
 # --------------------------------------------------------------------------- #
 def run_steered(cfg, agent, steer_vec, layer, alpha, n_rollouts, repeats,
@@ -200,6 +333,7 @@ def run_steered(cfg, agent, steer_vec, layer, alpha, n_rollouts, repeats,
                 print(f"  a={alpha:+.2f} rollout {idx:04d} "
                       f"(case {case_id:03d} rep {rep}): submitted={r['submitted']} "
                       f"forced={r['forced']} first_pass_turn={r['first_pass_turn']}")
+    return run_dir
 
 
 def run_unsteered_capture(cfg, agent, env_kind, n_rollouts, repeats, base_run_name):
@@ -296,9 +430,17 @@ def main():
                     help="dotted path to the decoder ModuleList if auto-detect is wrong")
     ap.add_argument("--env", choices=["parabola", "sine", "coupling"], default="parabola",
                     help="environment to run the test in (default: parabola)")
-    ap.add_argument("--mode", choices=["steer", "project"], default="steer",
+    ap.add_argument("--mode", choices=["steer", "project", "compare"], default="steer",
                     help="'steer': alpha sweep (Test 1). 'project': no steering, "
-                         "capture + plot per-turn projection onto the source axis (Test 2)")
+                         "capture + plot per-turn projection onto the source axis (Test 2). "
+                         "'compare': print per-layer cosine of this vector vs another "
+                         "directions file (no model loaded).")
+    ap.add_argument("--vector-type", choices=["set", "explore"], default="set",
+                    help="'set': SUBMIT-finalSET (current; directions.npz). "
+                         "'explore': SUBMIT-EXPLORE (directions_explore.npz).")
+    ap.add_argument("--compare-to", default=None,
+                    help="--mode compare: directions file to compare against "
+                         "(default <source-run-dir>/directions.npz).")
     ap.add_argument("--pool", choices=["before", "around", "all"], default="before",
                     help="token pool for projection (match your extraction)")
     ap.add_argument("--win", type=int, default=4, help="win for --pool around")
@@ -307,9 +449,29 @@ def main():
     if args.model:
         cfg.model_name = args.model
 
-    directions = args.directions or os.path.join(args.source_run_dir, "directions.npz")
+    _dfile = "directions_explore.npz" if args.vector_type == "explore" else "directions.npz"
+    directions = args.directions or os.path.join(args.source_run_dir, _dfile)
     if not os.path.exists(directions):
-        raise SystemExit(f"{directions} not found; run direction_extract.py first.")
+        raise SystemExit(f"{directions} not found; run direction_extract.py "
+                         "(or build_explore_directions.py for --vector-type explore) first.")
+
+    # --- compare mode: pure numpy, no model load ---
+    if args.mode == "compare":
+        compare_to = args.compare_to or os.path.join(args.source_run_dir, "directions.npz")
+        if not os.path.exists(compare_to):
+            raise SystemExit(f"{compare_to} not found; pass --compare-to.")
+        pairs = compare_directions(directions, compare_to)
+        print(f"[compare] per-layer cosine of the (SUBMIT-SET) steering axis")
+        print(f"          NEW = {directions}")
+        print(f"          OLD = {compare_to}")
+        for L, c in pairs:
+            print(f"   L{L:>2d}: cos = {c:+.4f}")
+        if pairs:
+            cs = np.array([c for _, c in pairs], float)
+            print(f"[compare] over {len(pairs)} shared layers: "
+                  f"mean {np.nanmean(cs):+.4f}  min {np.nanmin(cs):+.4f}  "
+                  f"max {np.nanmax(cs):+.4f}")
+        return
 
     layer = args.layer
     if layer is None:                               # default to the saved best layer

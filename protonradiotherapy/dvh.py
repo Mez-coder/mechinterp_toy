@@ -32,10 +32,24 @@ def mean_dose(dose, flat_mask):
     return float(d.mean()) if d.size else 0.0
 
 
+def hotspot(dose, flat_mask, near_max_pct=0.0):
+    """Hotspot dose in a structure. near_max_pct=0 -> true Dmax (hottest voxel);
+    set e.g. 2 for D2% (near-max) if Dmax is too noisy turn-to-turn."""
+    d = _doses(dose, flat_mask)
+    if d.size == 0:
+        return 0.0
+    if near_max_pct <= 0:
+        return float(d.max())
+    return float(np.percentile(d, 100 - near_max_pct))
+
+
 def evaluate_metric(metric, dose, flat_mask, Rx=1.0):
-    """Value for a metric string. D-% -> dose (Rx units); V-Gy -> percent."""
+    """Value for a metric string. D-% -> dose (Rx units); V-Gy -> percent;
+    'hotspot' -> Dmax; 'mean' -> mean dose."""
     if metric == 'mean':
         return mean_dose(dose, flat_mask)
+    if metric == 'hotspot':
+        return hotspot(dose, flat_mask)
     m = _METRIC.match(metric)
     if not m:
         raise ValueError(f'bad metric {metric}')

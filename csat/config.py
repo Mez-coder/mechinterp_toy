@@ -23,7 +23,7 @@ class Config:
     seed_start: int = 0
     n_rollouts: int = 200         # number of DISTINCT cases (landscapes)
     repeats_per_case: int = 1     # R: independent rollouts per case (same landscape, fresh sampling)
-    max_turns: int = 30
+    max_turns: int = 25
     # --- env ---
     # --- env selection ---
     env_kind: str = "coupling"        # "coupling" | "parabola" | "sine"
