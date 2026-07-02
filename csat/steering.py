@@ -164,33 +164,115 @@ def find_decoder_layers(model, override=None):
     return mod
 
 
-@contextlib.contextmanager
-def steering_active(model, block_idx, steer_vec, alpha, layers_attr=None):
-    """Add alpha * steer_vec to the OUTPUT of decoder block `block_idx` for the
-    duration of the context. block_idx = (hidden-state layer) - 1."""
-    import torch
-    layers = find_decoder_layers(model, layers_attr)
-    if not (0 <= block_idx < len(layers)):
-        raise SystemExit(f"block_idx {block_idx} out of range (0..{len(layers)-1}); "
-                         "check --layer.")
-    p = next(model.parameters())
-    steer = torch.tensor(steer_vec, dtype=p.dtype, device=p.device)
-    add = (alpha * steer)
+class steering_active:
+    """Context manager: add alpha * steer_vec to the OUTPUT of decoder block
+    `block_idx`. block_idx = (hidden-state layer) - 1.
 
-    def hook(_module, _inputs, output):
-        if alpha == 0.0:
+    gen_only (default True): apply the vector ONLY on single-token decode steps
+    (hs.shape[1] == 1, i.e. KV-cached generation), never on prefill forwards.
+    Steering prefill also perturbs the model's ENCODING of the prompt/feedback
+    (the margin numbers it is reading), confounding "steered decision" with
+    "corrupted perception". Caveat: with gen_only, the FIRST generated token of
+    each call comes out of the prefill forward and is therefore unsteered; every
+    token from the second onward is steered. Set gen_only=False to reproduce the
+    old all-positions behaviour (e.g. for an ablation).
+
+    Device handling: the add-vector is materialised lazily per device, so this
+    works when device_map splits the decoder stack across GPUs (the residual at
+    this block may live on a different device than model.parameters()[0]).
+
+    Counters (readable after/inside the `with` block):
+      n_steered_calls  -- forwards where the vector was added
+      n_prefill_skipped -- multi-token forwards skipped because gen_only
+    If gen_only is on and n_steered_calls stays 0 while n_prefill_skipped grows,
+    generation is running without a KV cache (use_cache=False) and nothing is
+    being steered -- a warning is printed on exit in that case.
+    """
+
+    def __init__(self, model, block_idx, steer_vec, alpha, layers_attr=None,
+                 gen_only=True, verbose=False):
+        layers = find_decoder_layers(model, layers_attr)
+        if not (0 <= block_idx < len(layers)):
+            raise SystemExit(f"block_idx {block_idx} out of range "
+                             f"(0..{len(layers)-1}); check --layer.")
+        self.block = layers[block_idx]
+        self.alpha = float(alpha)
+        self.gen_only = bool(gen_only)
+        self.verbose = verbose
+        self._add_np = (self.alpha * np.asarray(steer_vec, np.float32)).astype(np.float32)
+        self._cache = {}                       # (device, dtype) -> tensor
+        self.handle = None
+        self.n_steered_calls = 0
+        self.n_prefill_skipped = 0
+
+    def _add_for(self, device, dtype):
+        t = self._cache.get((device, dtype))
+        if t is None:
+            import torch
+            t = torch.tensor(self._add_np, dtype=torch.float32,
+                             device=device).to(dtype)
+            self._cache[(device, dtype)] = t
+        return t
+
+    def _hook(self, _module, _inputs, output):
+        if self.alpha == 0.0:
             return output
-        if isinstance(output, tuple):
-            hs = output[0]
-            hs = hs + add.to(hs.dtype).to(hs.device)
+        is_tuple = isinstance(output, tuple)
+        hs = output[0] if is_tuple else output
+        if self.gen_only and (hs.dim() != 3 or hs.shape[1] != 1):
+            self.n_prefill_skipped += 1        # prefill / non-cached forward
+            return output
+        hs = hs + self._add_for(hs.device, hs.dtype)
+        self.n_steered_calls += 1
+        if is_tuple:
             return (hs,) + tuple(output[1:])
-        return output + add.to(output.dtype).to(output.device)
+        return hs
 
-    handle = layers[block_idx].register_forward_hook(hook)
-    try:
-        yield
-    finally:
-        handle.remove()
+    def __enter__(self):
+        self.handle = self.block.register_forward_hook(self._hook)
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle:
+            self.handle.remove(); self.handle = None
+        if self.alpha != 0.0 and self.gen_only \
+                and self.n_steered_calls == 0 and self.n_prefill_skipped > 0:
+            print("[hook] WARNING: gen_only steering never fired "
+                  f"({self.n_prefill_skipped} multi-token forwards skipped). "
+                  "Generation is likely running with use_cache=False; "
+                  "nothing was steered.")
+        elif self.verbose and self.alpha != 0.0:
+            print(f"[hook] steered {self.n_steered_calls} decode tokens "
+                  f"(skipped {self.n_prefill_skipped} prefill forwards)")
+        return False
+
+
+def control_vector(steer_vec, seed=0, orth=False):
+    """Random control vector with the SAME L2 norm as steer_vec (so |alpha| means
+    the same perturbation size). orth=True projects out the real steering axis
+    first, guaranteeing zero overlap with it. Deterministic in `seed`."""
+    steer_vec = np.asarray(steer_vec, np.float32)
+    rng = np.random.default_rng(seed)
+    v = rng.standard_normal(steer_vec.shape[0]).astype(np.float32)
+    if orth:
+        u = steer_vec / (np.linalg.norm(steer_vec) + 1e-12)
+        v = v - float(v @ u) * u
+    v = v / (np.linalg.norm(v) + 1e-12) * float(np.linalg.norm(steer_vec))
+    cos = float(v @ steer_vec) / ((np.linalg.norm(v) * np.linalg.norm(steer_vec)) + 1e-12)
+    print(f"[control] random{'-orth' if orth else ''} vector (seed {seed}): "
+          f"|v|={np.linalg.norm(v):.2f}, cos(v, steer)={cos:+.4f}")
+    return v.astype(np.float32)
+
+
+def apply_control(steer_vec, control, control_seed):
+    """Swap steer_vec for a matched-norm control if requested. control is one of
+    'none' | 'random' | 'random-orth'. Returns (vec, tag) where tag is '' for the
+    real vector or a run-name suffix like '_ctlrandom0'."""
+    if control in (None, "none"):
+        return steer_vec, ""
+    orth = (control == "random-orth")
+    tag = f"_ctl{'randorth' if orth else 'random'}{control_seed}"
+    return control_vector(steer_vec, seed=control_seed, orth=orth), tag
 
 
 # --------------------------------------------------------------------------- #
@@ -299,28 +381,33 @@ class TriggerController:
 # parabola pipeline, steered, for one alpha
 # --------------------------------------------------------------------------- #
 def run_steered(cfg, agent, steer_vec, layer, alpha, n_rollouts, repeats,
-                base_run_name, env_kind="parabola", layers_attr=None):
+                base_run_name, env_kind="parabola", layers_attr=None,
+                gen_only=True, tag=""):
     """Run the single-margin pipeline under steering=alpha in `env_kind`; save
-    transcripts under a per-alpha run_name (no case_spread, no capture)."""
+    transcripts under a per-alpha run_name (no case_spread, no capture).
+    `tag` (e.g. '_ctlrandom0') keeps control runs from colliding with real ones."""
     block_idx = layer - 1                          # hidden_states[layer] = layers[layer-1] out
     cfg.env_kind = env_kind
     if env_kind == "sine":
         cfg.n_obj = 1                              # 1D action; the stopper reads cfg.n_obj
     cfg.capture = False                            # don't re-forward / contaminate under steering
-    cfg.run_name = f"{base_run_name}_{env_kind}_L{layer}_a{alpha:+.2f}".replace("+", "p").replace("-", "m")
+    cfg.run_name = (f"{base_run_name}_{env_kind}_L{layer}{tag}"
+                    f"_a{alpha:+.2f}").replace("+", "p").replace("-", "m")
 
     run_dir = cfg.run_dir()
     with open(os.path.join(run_dir, "steer_meta.json"), "w") as f:
         json.dump(dict(layer=int(layer), block_idx=int(block_idx), alpha=float(alpha),
                        env_kind=cfg.env_kind, n_rollouts=int(n_rollouts),
-                       repeats=int(repeats)), f, indent=2)
+                       repeats=int(repeats), gen_only=bool(gen_only),
+                       control_tag=tag), f, indent=2)
 
     seeds = list(range(cfg.seed_start, cfg.seed_start + n_rollouts))
     start = io.next_rollout_idx(run_dir)
     print(f"\n=== alpha={alpha:+.2f}  layer={layer}  -> {run_dir} "
           f"(resume from idx {start}) ===")
 
-    with steering_active(agent.model, block_idx, steer_vec, alpha, layers_attr):
+    with steering_active(agent.model, block_idx, steer_vec, alpha, layers_attr,
+                         gen_only=gen_only, verbose=True):
         for case_id, seed in enumerate(seeds):
             env = build_env(cfg); env.reset(seed=seed, wide=getattr(cfg, "wide_cases", True))
             opt = env.optimum()                    # parabola optimum is exact & cheap
@@ -444,6 +531,18 @@ def main():
     ap.add_argument("--pool", choices=["before", "around", "all"], default="before",
                     help="token pool for projection (match your extraction)")
     ap.add_argument("--win", type=int, default=4, help="win for --pool around")
+    ap.add_argument("--control", choices=["none", "random", "random-orth"],
+                    default="none",
+                    help="replace the steering vector with a matched-norm random "
+                         "vector ('random'), or one also orthogonalised to the "
+                         "real axis ('random-orth'). Run names get a _ctl tag.")
+    ap.add_argument("--control-seed", type=int, default=0,
+                    help="seed for the random control vector (vary to get "
+                         "several independent controls)")
+    ap.add_argument("--steer-prefill", action="store_true",
+                    help="ALSO steer prefill forwards (old behaviour). Default "
+                         "steers generated (decode) tokens only, so the model's "
+                         "reading of the prompt/feedback is never perturbed.")
     args = ap.parse_args()
 
     if args.model:
@@ -516,11 +615,13 @@ def main():
     print(f"[steer] layer {info['layer']}  |steer|={info['steer_norm']:.2f}  "
           f"= {info['frac']:.0%} of mean token norm {info['mean_token_norm']:.2f}  "
           f"(raw |SUBMIT-SET|={info['raw_norm']:.3f})")
+    steer_vec, ctl_tag = apply_control(steer_vec, args.control, args.control_seed)
     for alpha in args.alphas:
         run_steered(cfg, agent, steer_vec, layer, float(alpha),
                     n_rollouts=args.n_rollouts, repeats=args.repeats,
                     base_run_name=args.run_name, env_kind=args.env,
-                    layers_attr=args.layers_attr)
+                    layers_attr=args.layers_attr,
+                    gen_only=(not args.steer_prefill), tag=ctl_tag)
     print("\n[done] alpha sweep complete.")
 
 

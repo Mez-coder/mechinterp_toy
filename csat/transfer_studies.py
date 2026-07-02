@@ -37,7 +37,7 @@ from .dsl import parse_action, split_thinking
 from .prompts import system_prompt_for, render_case_for, render_feedback_for
 from .steering import (build_steering_vector, steering_active, load_direction,
                        run_steered, run_unsteered_capture, compare_directions,
-                       TriggerController)
+                       TriggerController, apply_control)
 from . import io_utils as io
 
 
@@ -128,7 +128,8 @@ def _advance(cfg, agent, env, messages, start_turn, snapshot_each=False,
 
 def run_composite(cfg, agent, steer_vec, layer, seed, alphas, out_run_dir, idx,
                   steer_ctx=steering_active, branch_extra=10, inject_at="final_set",
-                  opt=None, case_id=None, rep=None, branch_repeats=1):
+                  opt=None, case_id=None, rep=None, branch_repeats=1,
+                  null_branches=None, gen_only=True):
     """One case: baseline (alpha 0) run ONCE; then for each alpha, branch at the
     baseline BRANCH TURN and re-generate that turn onward under steering.
 
@@ -137,6 +138,14 @@ def run_composite(cfg, agent, steer_vec, layer, seed, alphas, out_run_dir, idx,
       so this is cheap -- only the post-branch turns are generated B times. It
       isolates the vector's effect from baseline-sampling noise and shows whether
       injecting converges to one exploration or several.
+
+    null_branches (default = branch_repeats): how many UNSTEERED (alpha=0)
+      re-branches to run from the SAME branch point. With temperature > 0 the
+      steered branch differs from the baseline in TWO ways -- the vector AND
+      resampling -- so the honest null is 'resample without the vector'. These
+      land in the summary as keys '+0.00_b01', '+0.00_b02', ... ('+0.00_b00'
+      stays the untouched baseline). Compare steered submit rates / margins
+      against the null branches, not against the baseline alone.
 
     inject_at: 'final_set' (last SET before the baseline submit; default) or
       'submit' (the submit turn itself)."""
@@ -163,20 +172,25 @@ def run_composite(cfg, agent, steer_vec, layer, seed, alphas, out_run_dir, idx,
         # else: model submitted with no prior SET -> fall back to the submit turn
 
     B = max(1, int(branch_repeats))
+    NB = B if null_branches is None else max(0, int(null_branches))
     realizations = {(0.0, 0): base}                   # (alpha, branch_rep) -> result
     if base["submitted"] and branch_turn is not None and branch_turn in base["snaps"]:
         env_b, msgs_b = base["snaps"][branch_turn]    # state at the START of the branch turn
         stop_at = min(cfg.max_turns, branch_turn + branch_extra)   # bound branch compute
-        for a in alphas:
-            for b in range(B):
-                e2, m2 = copy.deepcopy(env_b), list(msgs_b)
-                with steer_ctx(agent.model, block_idx, steer_vec, a):
-                    res = _advance(cfg, agent, e2, m2, branch_turn, snapshot_each=False,
-                                   stop_after_turn=stop_at, tag=f"a{a:+.1f}b{b}")
-                realizations[(a, b)] = res
-                _free()
-                print(f"    alpha {a:+.1f} branch {b}: ran turns {branch_turn}.."
-                      f"{res['n_turns']} (submitted={res['submitted']})")
+        # (alpha, branch_rep) pairs to run: null re-branches first (alpha 0, b>=1
+        # so b=0 stays the untouched baseline), then the steered fan-out.
+        todo = [(0.0, 1 + b) for b in range(NB)]
+        todo += [(a, b) for a in alphas if a != 0.0 for b in range(B)]
+        for a, b in todo:
+            e2, m2 = copy.deepcopy(env_b), list(msgs_b)
+            with steer_ctx(agent.model, block_idx, steer_vec, a, gen_only=gen_only):
+                res = _advance(cfg, agent, e2, m2, branch_turn, snapshot_each=False,
+                               stop_after_turn=stop_at, tag=f"a{a:+.1f}b{b}")
+            realizations[(a, b)] = res
+            _free()
+            kind = "null " if a == 0.0 else ""
+            print(f"    {kind}alpha {a:+.1f} branch {b}: ran turns {branch_turn}.."
+                  f"{res['n_turns']} (submitted={res['submitted']})")
     else:
         print(f"  [composite] rollout {idx:04d} baseline forced / no branch turn; "
               f"only alpha 0 saved.")
@@ -205,6 +219,7 @@ def run_composite(cfg, agent, steer_vec, layer, seed, alphas, out_run_dir, idx,
                 submitted=submitted, submit_turn=st, n_turns=nt,
                 is_submit=bool(submitted and st is not None
                                and rec.get("turn") == st and rec.get("action") == "submit"),
+                is_branch=(not is_base),          # False = untouched baseline
                 branch_turn=branch_turn, branch_kind=branch_kind, optimum_margin=opt_m,
                 gap=((opt_m - mg) if (opt_m is not None and mg is not None) else None)))
         trajectories[(a, b)] = traj
@@ -223,21 +238,142 @@ def run_composite(cfg, agent, steer_vec, layer, seed, alphas, out_run_dir, idx,
                 rows=rows, T=branch_turn, branch_kind=branch_kind)
 
 
-def _sval(r, a, key):
-    v = r["summary"].get(a, {}).get(key)
+def _iter_summary(r):
+    """Yield (alpha, branch_rep, entry) from a composite_summary dict, robust to
+    the key format 'sA.BC_bDD'. b=0 at alpha 0 is the untouched baseline; b>=1 at
+    alpha 0 are the resampled null branches."""
+    for key, entry in r["summary"].items():
+        a = entry.get("alpha")
+        b = entry.get("branch_rep", 0)
+        if a is None:                                  # fall back to parsing the key
+            try:
+                astr, bstr = key.rsplit("_b", 1)
+                a, b = float(astr), int(bstr)
+            except (ValueError, AttributeError):
+                continue
+        yield float(a), int(b), entry
+
+
+def _fnum(v):
     return float(v) if v is not None else float("nan")
+
+
+def summarize_branch_null(results, seed=0, n_boot=2000):
+    """Compare steered branches against the alpha=0 NULL branches (resampled from
+    the same branch point), which is the honest counterfactual under sampling.
+
+    Per alpha, over cases that have >=1 null branch and >=1 branch at that alpha:
+      submit_rate        -- fraction of branches that submitted within the window
+      mean_final_margin  -- over branches
+      mean_delta_margin  -- per-case (mean steered margin - mean null margin),
+                            averaged over cases, with a paired case-level
+                            bootstrap 95% CI
+      delta_submit_rate  -- same construction on the submitted indicator
+    The pairing is by CASE (same branch point), so baseline-sampling noise
+    cancels; the bootstrap resamples cases, respecting the clustering."""
+    per_case = {}                                      # idx -> {alpha: [(margin, submitted)]}
+    for r in results:
+        d = per_case.setdefault(r["idx"], {})
+        for a, b, e in _iter_summary(r):
+            if a == 0.0 and b == 0:
+                continue                               # untouched baseline: not a branch
+            d.setdefault(a, []).append((_fnum(e.get("final_margin")),
+                                        bool(e.get("submitted"))))
+    alphas = sorted({a for d in per_case.values() for a in d if a != 0.0})
+    rng = np.random.default_rng(seed)
+    out = {}
+
+    def _case_means(a):
+        """(delta_margin, delta_submit) per case with both null and alpha-a branches."""
+        dm, ds = [], []
+        for d in per_case.values():
+            nulls, steered = d.get(0.0), d.get(a)
+            if not nulls or not steered:
+                continue
+            nm = np.nanmean([m for m, _ in nulls]); ns = np.mean([s for _, s in nulls])
+            sm = np.nanmean([m for m, _ in steered]); ss = np.mean([s for _, s in steered])
+            dm.append(sm - nm); ds.append(ss - ns)
+        return np.asarray(dm, float), np.asarray(ds, float)
+
+    def _boot_ci(x):
+        if len(x) < 2:
+            return (None, None)
+        idx = rng.integers(0, len(x), size=(n_boot, len(x)))
+        means = np.nanmean(x[idx], axis=1)
+        return (float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5)))
+
+    # null row
+    null_flat = [t for d in per_case.values() for t in d.get(0.0, [])]
+    if null_flat:
+        out[0.0] = dict(role="null (resampled, unsteered)",
+                        n_branches=len(null_flat),
+                        submit_rate=float(np.mean([s for _, s in null_flat])),
+                        mean_final_margin=float(np.nanmean([m for m, _ in null_flat])))
+    for a in alphas:
+        flat = [t for d in per_case.values() for t in d.get(a, [])]
+        dm, ds = _case_means(a)
+        row = dict(role="steered", n_branches=len(flat),
+                   submit_rate=(float(np.mean([s for _, s in flat])) if flat else None),
+                   mean_final_margin=(float(np.nanmean([m for m, _ in flat]))
+                                      if flat else None),
+                   n_paired_cases=int(len(dm)))
+        if len(dm):
+            lo, hi = _boot_ci(dm)
+            row.update(mean_delta_margin_vs_null=float(np.nanmean(dm)),
+                       delta_margin_ci95=[lo, hi])
+            lo, hi = _boot_ci(ds)
+            row.update(delta_submit_rate_vs_null=float(np.nanmean(ds)),
+                       delta_submit_ci95=[lo, hi])
+        out[a] = row
+    return out
+
+
+def print_branch_null(summ):
+    if 0.0 not in summ:
+        print("[composite] no null branches found (run with --null-branches >= 1 "
+              "to get the resampled alpha-0 counterfactual).")
+        return
+    s0 = summ[0.0]
+    print(f"\n[composite] branch-vs-null (paired by case; null = resampled alpha 0):")
+    print(f"   null      : n={s0['n_branches']}  submit_rate={s0['submit_rate']:.0%}  "
+          f"mean_final_margin={s0['mean_final_margin']:+.4f}")
+    for a, s in sorted(summ.items()):
+        if a == 0.0:
+            continue
+        line = (f"   alpha {a:+.1f}: n={s['n_branches']}  "
+                f"submit_rate={s['submit_rate']:.0%}  "
+                f"mean_final_margin={s['mean_final_margin']:+.4f}")
+        if s.get("mean_delta_margin_vs_null") is not None:
+            lo, hi = s["delta_margin_ci95"]
+            ci = (f" [{lo:+.4f},{hi:+.4f}]" if lo is not None else "")
+            line += (f"  d_margin_vs_null={s['mean_delta_margin_vs_null']:+.4f}{ci}"
+                     f"  d_submit={s['delta_submit_rate_vs_null']:+.2f}"
+                     f"  (paired cases={s['n_paired_cases']})")
+        print(line)
 
 
 def summarize_composite(results, alphas):
     """Aggregate across rollouts: mean final priority margin, mean gap to the case
     optimum, mean improvement over baseline, and fraction of rollouts where the
-    steered run ended with a STRICTLY larger margin than its own baseline."""
-    base_fm = np.array([_sval(r, 0.0, "final_margin") for r in results])
+    steered run ended with a STRICTLY larger margin than its own baseline.
+    (Aggregates over branch reps; deltas are vs the UNTOUCHED baseline -- for the
+    resampling-honest comparison use summarize_branch_null.)"""
+    def _mean_over_reps(r, a, key, base_only=False):
+        vals = [_fnum(e.get(key)) for aa, b, e in _iter_summary(r)
+                if aa == a and (b == 0 if base_only else not (a == 0.0 and b == 0))]
+        vals = [v for v in vals if not np.isnan(v)]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    base_fm = np.array([_mean_over_reps(r, 0.0, "final_margin", base_only=True)
+                        for r in results])
     out = {}
-    for a in [0.0] + list(alphas):
-        fm = np.array([_sval(r, a, "final_margin") for r in results])
-        gap = np.array([_sval(r, a, "gap") for r in results])
-        row = dict(mean_final_margin=float(np.nanmean(fm)) if fm.size else None,
+    for a in [0.0] + [x for x in alphas if x != 0.0]:
+        fm = np.array([_mean_over_reps(r, a, "final_margin", base_only=(a == 0.0))
+                       for r in results])
+        gap = np.array([_mean_over_reps(r, a, "gap", base_only=(a == 0.0))
+                        for r in results])
+        row = dict(mean_final_margin=(float(np.nanmean(fm))
+                                      if not np.all(np.isnan(fm)) else None),
                    mean_gap=(float(np.nanmean(gap)) if not np.all(np.isnan(gap)) else None),
                    n=int(np.sum(~np.isnan(fm))))
         if a == 0.0:
@@ -402,10 +538,13 @@ def _trim_eos(ids, eos):
 
 def run_story_study(agent, steer_vec, layer, prompts, alphas, n_repeats, max_new,
                     steer_ctx=steering_active, encode_fn=_story_prompt_ids,
-                    gen_fn=_gen_continuation, concat_fn=_concat_prefix):
+                    gen_fn=_gen_continuation, concat_fn=_concat_prefix,
+                    gen_only=True):
     """For each repeat: generate a baseline story, cut at the midpoint, and continue
-    the first half unsteered (alpha 0) and under each alpha (steering EVERY new
-    token). Returns rows of continuation lengths. Hypotheses:
+    the first half unsteered (alpha 0) and under each alpha (steering every NEW
+    token; the prefix encode is unsteered when gen_only). Returns rows of
+    continuation lengths (with a 'capped' flag when a continuation hit max_new --
+    those lengths are censored, so report frac_capped alongside means). Hypotheses:
         alpha > 0 (toward SUBMIT/stop)     -> continuation SHORTER than alpha 0
         alpha < 0 (toward SET/keep going)  -> continuation LONGER  than alpha 0"""
     block_idx = layer - 1
@@ -418,30 +557,44 @@ def run_story_study(agent, steer_vec, layer, prompts, alphas, n_repeats, max_new
         base_len = len(base_cont)
         half = max(1, base_len // 2)
         prefix = concat_fn(pids, base_cont[:half])
-        cont = {}
+        cont, capped = {}, {}
         for a in [0.0] + list(alphas):
             if a == 0.0:
                 c = _trim_eos(gen_fn(agent, prefix, max_new), eos)
             else:
-                with steer_ctx(agent.model, block_idx, steer_vec, a):
+                with steer_ctx(agent.model, block_idx, steer_vec, a,
+                               gen_only=gen_only):
                     c = _trim_eos(gen_fn(agent, prefix, max_new), eos)
             cont[a] = len(c)
-        rows.append(dict(repeat=r, prompt=prompt, base_len=base_len, half=half, cont=cont))
+            capped[a] = bool(len(c) >= max_new)   # hit the ceiling: length censored
+        rows.append(dict(repeat=r, prompt=prompt, base_len=base_len, half=half,
+                         cont=cont, capped=capped))
         deltas = " ".join(f"a{a:+.1f}:{cont[a]}({cont[a]-cont[0.0]:+d})"
+                          + ("^" if capped[a] else "")
                           for a in alphas)
-        print(f"  story r{r}: base_len={base_len} half={half} cont0={cont[0.0]}  {deltas}")
+        print(f"  story r{r}: base_len={base_len} half={half} cont0={cont[0.0]}"
+              f"{'^' if capped[0.0] else ''}  {deltas}   (^ = hit max_new)")
     return rows
 
 
 def summarize_story(rows, alphas):
-    """Mean continuation length per alpha and mean signed delta vs alpha 0."""
+    """Mean continuation length per alpha and mean signed delta vs alpha 0.
+    frac_capped = fraction of continuations that hit max_new (length-censored;
+    a high frac_capped at negative alpha means the true lengthening is
+    UNDERestimated and the mean is not trustworthy)."""
+    def _cap(a):
+        vals = [r.get("capped", {}).get(a) for r in rows]
+        vals = [v for v in vals if v is not None]
+        return float(np.mean(vals)) if vals else None
     out = {}
     c0 = np.array([r["cont"][0.0] for r in rows], float)
-    out[0.0] = dict(mean_len=float(c0.mean()), mean_delta=0.0, n=len(rows))
+    out[0.0] = dict(mean_len=float(c0.mean()), mean_delta=0.0, n=len(rows),
+                    frac_capped=_cap(0.0))
     for a in alphas:
         ca = np.array([r["cont"][a] for r in rows], float)
         out[a] = dict(mean_len=float(ca.mean()),
-                      mean_delta=float((ca - c0).mean()), n=len(rows))
+                      mean_delta=float((ca - c0).mean()), n=len(rows),
+                      frac_capped=_cap(a))
     return out
 
 
@@ -532,6 +685,23 @@ def main():
                     help="composite: fan out N steered continuations from the SAME "
                          "baseline branch point per alpha (cheap; reuses the prefix). "
                          "Use with --n-rollouts 1 to study one baseline's divergence.")
+    ap.add_argument("--null-branches", type=int, default=None,
+                    help="composite: N UNSTEERED (alpha 0) re-branches from the same "
+                         "branch point -- the resampling-honest null the steered "
+                         "branches are compared against (default: = --branch-repeats; "
+                         "3+ recommended when temperature > 0).")
+    ap.add_argument("--control", choices=["none", "random", "random-orth"],
+                    default="none",
+                    help="replace the steering vector with a matched-norm random "
+                         "vector ('random'), or one also orthogonalised to the real "
+                         "axis ('random-orth'). Applies to steer/composite/story and "
+                         "the trigger's INJECTED vector. Run names get a _ctl tag.")
+    ap.add_argument("--control-seed", type=int, default=0,
+                    help="seed for the random control vector")
+    ap.add_argument("--steer-prefill", action="store_true",
+                    help="ALSO steer prefill forwards (old behaviour). Default is "
+                         "generation-only, so the model's reading of the prompt/"
+                         "feedback numbers is never perturbed.")
     ap.add_argument("--gen-max-new", type=int, default=None,
                     help="override cfg.max_new_tokens for the per-turn optimisation "
                          "generation (composite). Lower (e.g. 1024-1536) to cut OOM.")
@@ -600,14 +770,17 @@ def main():
                                                 args.source_run_dir, frac=args.frac)
         print(f"[steer] layer {info['layer']}  |steer|={info['steer_norm']:.2f}  "
               f"= {info['frac']:.0%} of mean token norm {info['mean_token_norm']:.2f}")
+        steer_vec, ctl_tag = apply_control(steer_vec, args.control, args.control_seed)
         alpha_dirs = []
         for alpha in alphas:
             rd = run_steered(cfg, agent, steer_vec, layer, float(alpha),
                              n_rollouts=args.n_rollouts, repeats=repeats,
                              base_run_name=args.run_name, env_kind=args.env,
-                             layers_attr=args.layers_attr)
+                             layers_attr=args.layers_attr,
+                             gen_only=(not args.steer_prefill), tag=ctl_tag)
             alpha_dirs.append(rd)
-        out_run_dir = os.path.join(cfg.out_dir, f"{args.run_name}_{args.env}_L{layer}_steer")
+        out_run_dir = os.path.join(cfg.out_dir,
+                                   f"{args.run_name}_{args.env}_L{layer}{ctl_tag}_steer")
         cp.rebuild_steer(alpha_dirs, out_run_dir, write=True)   # tidy CSV (kind=steer)
         cp.plot(out_run_dir, passing=args.plot_passing)         # auto-detects kind
         print(f"[done] steer sweep complete -> {out_run_dir}")
@@ -640,14 +813,19 @@ def main():
         set_v, sub_v = load_direction(detect_path, layer)            # detector axis
         steer_vec, info = build_steering_vector(layer, steer_path,
                                                 args.source_run_dir, frac=args.frac)
-        print(f"[trigger] detect={args.detect_vec} steer={args.steer_vec} "
+        # control applies to the INJECTED vector only; the detector axis stays real
+        # (a random injection under a real detector tests whether closed-loop gains
+        # come from the direction or from perturbation per se).
+        steer_vec, ctl_tag = apply_control(steer_vec, args.control, args.control_seed)
+        print(f"[trigger] detect={args.detect_vec} steer={args.steer_vec}{ctl_tag} "
               f"alpha={args.alpha:+.2f} L{layer} steer_proj={args.steer_proj} "
               f"k={args.k} steer_k={args.steer_k} ({args.trigger}); "
               f"|steer|={info['steer_norm']:.2f}")
         ctrl = TriggerController(agent.model, layer - 1, set_v, sub_v, steer_vec,
                                  args.alpha, args.steer_proj, args.k, args.steer_k,
                                  trigger=args.trigger, layers_attr=args.layers_attr)
-        out_run_dir = os.path.join(cfg.out_dir, f"{args.run_name}_{args.env}_L{layer}_trigger")
+        out_run_dir = os.path.join(cfg.out_dir,
+                                   f"{args.run_name}_{args.env}_L{layer}{ctl_tag}_trigger")
         rows = run_trigger(cfg, agent, ctrl, args.env, args.n_rollouts, repeats, out_run_dir)
         cp.write_data(out_run_dir, rows, meta=dict(
             kind="trigger", env=args.env, layer=layer, detect_vec=args.detect_vec,
@@ -661,6 +839,8 @@ def main():
     steer_vec, info = build_steering_vector(layer, directions, args.source_run_dir, frac=args.frac)
     print(f"[transfer] layer {layer}  |steer|={info['steer_norm']:.2f} "
           f"({info['frac']:.0%} of token norm {info['mean_token_norm']:.2f})")
+    steer_vec, ctl_tag = apply_control(steer_vec, args.control, args.control_seed)
+    gen_only = not args.steer_prefill
 
     if args.study == "composite":
         alphas = args.alphas if args.alphas is not None else [-0.5, -1.0]
@@ -669,16 +849,25 @@ def main():
             cfg.n_obj = 1
         cfg.capture = False
         cfg.run_name = (f"{args.run_name}_composite_{args.env}"
-                        f"_{args.vector_type}_{args.inject_at}_L{layer}")
+                        f"_{args.vector_type}_{args.inject_at}_L{layer}{ctl_tag}")
         out_run_dir = cfg.run_dir()
         seeds = list(range(cfg.seed_start, cfg.seed_start + args.n_rollouts))
         from . import composite_plot as cp
+        null_b = (args.null_branches if args.null_branches is not None
+                  else args.branch_repeats)
+        if null_b < 2 and cfg.temperature > 0:
+            print("[composite] note: temperature > 0 with only "
+                  f"{null_b} null branch(es); the resampled-null comparison will "
+                  "be noisy. Consider --null-branches 3 (or more).")
 
         # write run meta up front so a later crash still leaves a titled rebuild
         cp.write_data(out_run_dir, [], meta=dict(
             study="composite", env=args.env, vector_type=args.vector_type,
             inject_at=args.inject_at, layer=layer, frac=args.frac,
             alphas=list(alphas), n_rollouts=args.n_rollouts, repeats=repeats,
+            branch_repeats=args.branch_repeats, null_branches=null_b,
+            control=args.control, control_seed=args.control_seed,
+            gen_only=gen_only,
             model_name=cfg.model_name, run_name=cfg.run_name,
             source_run_dir=args.source_run_dir)) if not os.path.exists(
             os.path.join(out_run_dir, "composite_meta.json")) else None
@@ -701,7 +890,8 @@ def main():
                               out_run_dir, idx, branch_extra=args.branch_extra,
                               inject_at=args.inject_at, opt=opt,
                               case_id=case_id, rep=rep,
-                              branch_repeats=args.branch_repeats)
+                              branch_repeats=args.branch_repeats,
+                              null_branches=null_b, gen_only=gen_only)
                 n_run += 1
                 _free()                                # release between rollouts
         if n_done:
@@ -731,24 +921,43 @@ def main():
             print(line)
         with open(os.path.join(out_run_dir, "composite_aggregate.json"), "w") as f:
             json.dump({str(k): v for k, v in summ.items()}, f, indent=2)
+
+        # ---- resampled-null comparison (loads composite_summary.json from disk,
+        #      so it also covers rollouts finished in earlier resumed runs) ----
+        import glob as _glob
+        results = []
+        for p in sorted(_glob.glob(os.path.join(out_run_dir, "rollout_*",
+                                                "composite_summary.json"))):
+            try:
+                with open(p) as f:
+                    results.append(json.load(f))
+            except (json.JSONDecodeError, OSError):
+                continue
+        nsumm = summarize_branch_null(results)
+        print_branch_null(nsumm)
+        with open(os.path.join(out_run_dir, "composite_null_summary.json"), "w") as f:
+            json.dump({str(k): v for k, v in nsumm.items()}, f, indent=2)
         print("[done] composite study complete.")
         return
 
     # story
     alphas = args.alphas if args.alphas is not None else [-0.5, 0.5]
     prompts = [args.prompt] if args.prompt else DEFAULT_STORY_PROMPTS
-    cfg.run_name = f"{args.run_name}_story_L{layer}"
+    cfg.run_name = f"{args.run_name}_story_L{layer}{ctl_tag}"
     out_run_dir = cfg.run_dir()
     rows = run_story_study(agent, steer_vec, layer, prompts, alphas,
                            n_repeats=(args.n_repeats if args.n_repeats is not None else 5),
-                           max_new=args.max_new)
+                           max_new=args.max_new, gen_only=gen_only)
     with open(os.path.join(out_run_dir, "story_rows.json"), "w") as f:
         json.dump(rows, f, indent=2)
     summ = summarize_story(rows, alphas)
     print("\n[story] mean continuation length per alpha (delta vs unsteered):")
     for a in [0.0] + list(alphas):
         s = summ[a]
-        print(f"   alpha {a:+.1f}: mean_len={s['mean_len']:.1f}  mean_delta={s['mean_delta']:+.1f}")
+        cap = (f"  capped={s['frac_capped']:.0%}"
+               if s.get("frac_capped") is not None else "")
+        print(f"   alpha {a:+.1f}: mean_len={s['mean_len']:.1f}  "
+              f"mean_delta={s['mean_delta']:+.1f}{cap}")
     plot_story(rows, alphas, os.path.join(out_run_dir, "story_lengths.png"))
     print("[done] story study complete.")
 

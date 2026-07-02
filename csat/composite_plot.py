@@ -185,7 +185,12 @@ def aggregate_from_rows(rows):
     base = {i: m for (i, a, b), (t, m, g) in fin.items() if a == 0.0 and b == 0}
     out = {}
     for a in [0.0] + alphas:
-        items = [(i, v) for (i, aa, _b), v in fin.items() if aa == a]
+        # alpha 0.0 row = the UNTOUCHED baseline only (b == 0). Resampled null
+        # branches (alpha 0, b >= 1, from --null-branches) are excluded here so
+        # this row's meaning is stable whether or not nulls were run; the
+        # null-vs-steered comparison lives in composite_null_summary.json.
+        items = [(i, v) for (i, aa, _b), v in fin.items()
+                 if aa == a and not (a == 0.0 and _b > 0)]
         fm = [v[1] for (_i, v) in items if v[1] is not None]
         gp = [v[2] for (_i, v) in items if v[2] is not None]
         dl = [v[1] - base[i] for (i, v) in items
@@ -534,11 +539,13 @@ def _plot_composite(rows, meta, out_dir, view="auto", y="margin", stars="steered
             if view == "repeats":
                 color = ucol[uidx[rp]]; lstyle = cond_ls.get(a, "--")
             else:
-                if a == 0.0:
-                    color, lstyle = "black", "-"
+                if a == 0.0 and bp == 0:
+                    color, lstyle = "black", "-"       # untouched baseline
+                elif a == 0.0:
+                    color, lstyle = "0.6", "-"         # resampled null branch
                 else:
                     color, lstyle = ucol[uidx[bp]], cond_ls.get(a, "--")
-            lw = 1.9 if a == 0.0 else 1.3
+            lw = 1.9 if (a == 0.0 and bp == 0) else (1.1 if a == 0.0 else 1.3)
             _draw_traj(ax, pts, color, lstyle, lw, passing=passing)
             show_star = (stars == "all") or (stars == "steered" and a != 0.0)
             if show_star and tr[0]["submitted"] and tr[0]["submit_turn"] is not None:
@@ -563,9 +570,13 @@ def _plot_composite(rows, meta, out_dir, view="auto", y="margin", stars="steered
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("turn"); ax.set_ylabel(y); ax.grid(alpha=0.3)
 
-        handles = [Line2D([0], [0], color="gray", ls=cond_ls[c],
-                          label=("unsteered" if c == 0.0 else f"\u03b1 {c:+.1f}"))
+        handles = [Line2D([0], [0], color=("black" if c == 0.0 else "gray"),
+                          ls=cond_ls[c],
+                          label=("baseline" if c == 0.0 else f"\u03b1 {c:+.1f}"))
                    for c in conds]
+        if view == "fanout" and any(k[2] == 0.0 and k[3] > 0 for k in keys):
+            handles.append(Line2D([0], [0], color="0.6", ls="-",
+                                  label="null branch (\u03b1 0, resampled)"))
         if passing in ("segment", "marker"):
             handles += [Line2D([0], [0], marker="o", lw=0, color="gray", label="passing"),
                         Line2D([0], [0], marker="o", lw=0, mfc="white", mec="gray",
