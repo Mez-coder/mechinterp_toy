@@ -24,7 +24,8 @@ The end of your reply must contain exactly ONE action:
 Give one number per objective, in order. E.g. 'SET 0.1 0.1 0.1'. There is no limit on iterations, SUBMIT when you \
 are done.
 You may lower a weight as well as raise it -- a weight you fixed early on is not locked in, and it is worth \
-checking whether a different setting does better before you finalise. Submit when you are happy."""
+checking whether a different setting does better before you finalise. Submit when you are happy. \
+Respond with fewer than 100 words in total."""
 
 
 PARABOLA_SYSTEM_PROMPT = """\
@@ -40,7 +41,7 @@ Your goal has two parts, in order:
 The end of your reply must contain exactly ONE action:
   [SET w1 w2 ...]    -> set every coordinate (each 0 to 1, in order); the system re-evaluates and shows the new margin
   [SUBMIT w1 w2 ...] -> finalise the plan with those coordinates
-Submit when you have an optimal plan."""
+Submit when you have an optimal plan. Respond with fewer than 100 words in total."""
 
 
 SINE_SYSTEM_PROMPT = """\
@@ -56,7 +57,7 @@ Your goal has two parts, in order:
 The end of your reply must contain exactly ONE action:
   [SET x1]    -> set the coordinate (between 0 to 1); the system re-evaluates and shows the new margin
   [SUBMIT x1] -> finalise the plan with that coordinate
-Submit when you have an optimal plan."""
+Submit when you have an optimal plan. Respond JUST with the action, do not produce any other tokens."""
 
 
 def render_case(env, max_turns):
@@ -75,7 +76,8 @@ def render_case(env, max_turns):
 def render_case_parabola(env, max_turns):
     s = [f"New plan with {env.n_obj} coordinates (w1..w{env.n_obj}). "
          "You begin from a mid-range plan (all coordinates 0.5), shown below.",
-         "There is a single hidden margin to maximise; find the coordinates that make it as large as possible.",
+         "There is a single hidden margin to maximise; find the coordinates that make it as large as possible. \
+         Use fewer than 100 words per response.",
          "Starting state:", ""]
     s.append(render_feedback(env.feedback(), turn=0, max_turns=max_turns, priority=None))
     return "\n".join(s)

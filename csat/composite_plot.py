@@ -846,6 +846,286 @@ def _plot_trigger_traces(run_dir, meta, out_dir):
     return written
 
 
+
+# =========================================================================== #
+# paired per-rollout stats: steered vs resampled-null, one delta per rollout
+# =========================================================================== #
+def _post_branch_weights(tf_path, branch_turn):
+    """Weight vectors of the turns this branch actually generated
+    (turn >= branch_turn), in order, from a transcript_a*.jsonl."""
+    W = []
+    if not os.path.exists(tf_path):
+        return W
+    with open(tf_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t, wv = rec.get("turn"), rec.get("weight_vec")
+            if t is None or wv is None:
+                continue
+            if branch_turn is None or t >= branch_turn:
+                W.append(np.asarray(wv, float))
+    return W
+
+
+def _explore_metrics(W, ndp=3):
+    """Exploration of a weight trajectory: distinct points tried, total path
+    length, and max displacement from the branch-point weights."""
+    if not W:
+        return dict(n_points=0, n_unique=0, path_len=0.0, max_disp=0.0)
+    uniq = {tuple(np.round(w, ndp)) for w in W}
+    path = float(sum(np.linalg.norm(W[i + 1] - W[i]) for i in range(len(W) - 1)))
+    disp = float(max(np.linalg.norm(w - W[0]) for w in W))
+    return dict(n_points=len(W), n_unique=len(uniq), path_len=path, max_disp=disp)
+
+
+def paired_rollout_stats(run_dir, ndp=3, opt_eps=1e-6):
+    """One record per (rollout, steered alpha): paired deltas of the steered
+    branches' means MINUS the null (alpha 0, b>=1) branches' means, for:
+
+      d_best_norm / d_final_norm -- margin delta as a PERCENTAGE OF THE CASE
+          OPTIMUM (parabola/sine: optimum_margin = z_pass > 0 known exactly).
+          Comparable across cases; well-defined for failing (negative) margins,
+          unlike percent-of-baseline which explodes when the null margin ~ 0.
+      d_turns        -- extra turns generated past the branch point (persistence;
+                        censored at the branch window for non-submitting branches)
+      d_submit_rate  -- steered minus null submit rate within the window
+      d_unique / d_path_len / d_max_disp -- exploration of the post-branch
+                        weight trajectory (distinct points tried, path length,
+                        max displacement from the branch point)
+
+    ever_passed marks cases where ANY branch/baseline achieved margin >= 0 --
+    split on it to ask 'on impossible cases, did steering at least try harder?'.
+    pct_vs_null (percent change vs the null margin) is included in the JSON for
+    completeness but is unstable when the null margin is near zero."""
+    import glob, re
+    out = []
+    for d in sorted(glob.glob(os.path.join(run_dir, "rollout_*"))):
+        sp = os.path.join(d, "composite_summary.json")
+        if not os.path.exists(sp):
+            continue
+        with open(sp) as f:
+            summ = json.load(f)
+        bt = summ.get("branch_turn")
+        opt = _f(summ.get("optimum_margin"))
+        per_alpha = {}
+        ever_passed = False
+        for key, e in summ.get("summary", {}).items():
+            a, b = e.get("alpha"), e.get("branch_rep", 0)
+            if a is None:
+                m = re.match(r"([+-]?\d+\.\d+)_b(\d+)$", key)
+                if not m:
+                    continue
+                a, b = float(m.group(1)), int(m.group(2))
+            a = float(a)
+            best = _f(e.get("best_margin"))
+            fin = _f(e.get("final_margin"))
+            if (best is not None and best >= 0) or (fin is not None and fin >= 0):
+                ever_passed = True
+            if a == 0.0 and b == 0:
+                continue                             # untouched baseline
+            tf = os.path.join(d, f"transcript_a{a:+.2f}_b{b:02d}.jsonl")
+            ex = _explore_metrics(_post_branch_weights(tf, bt), ndp)
+            nt = _i(e.get("n_turns"))
+            per_alpha.setdefault(a, []).append(dict(
+                best=best, final=fin, submitted=bool(e.get("submitted")),
+                turns_past=(None if (nt is None or bt is None)
+                            else max(0, nt - bt + 1)), **ex))
+        nulls = per_alpha.get(0.0)
+        if not nulls:
+            continue
+
+        def _m(entries, key):
+            vals = [x[key] for x in entries if x.get(key) is not None]
+            return float(np.mean(vals)) if vals else None
+
+        for a, steered in per_alpha.items():
+            if a == 0.0:
+                continue
+            rec = dict(rollout=os.path.basename(d), idx=summ.get("idx"),
+                       alpha=a, n_steered=len(steered), n_null=len(nulls),
+                       optimum_margin=opt, ever_passed=ever_passed,
+                       branch_turn=bt)
+            for key, name in [("best", "best"), ("final", "final")]:
+                sv, nv = _m(steered, key), _m(nulls, key)
+                if sv is None or nv is None:
+                    continue
+                rec[f"d_{name}"] = sv - nv
+                if opt is not None and opt > opt_eps:
+                    rec[f"d_{name}_norm"] = 100.0 * (sv - nv) / opt
+                if abs(nv) > 1e-9:
+                    rec[f"pct_{name}_vs_null"] = 100.0 * (sv - nv) / abs(nv)
+            for key, name in [("turns_past", "turns_past"), ("n_unique", "unique"),
+                              ("path_len", "path_len"), ("max_disp", "max_disp")]:
+                sv, nv = _m(steered, key), _m(nulls, key)
+                if sv is not None and nv is not None:
+                    rec[f"d_{name}"] = sv - nv
+            rec["d_submit_rate"] = (float(np.mean([x["submitted"] for x in steered]))
+                                    - float(np.mean([x["submitted"] for x in nulls])))
+            out.append(rec)
+    return out
+
+
+def _boot_mean_ci(x, n_boot=4000, seed=0):
+    x = np.asarray([v for v in x if v is not None], float)
+    x = x[~np.isnan(x)]
+    if len(x) < 2:
+        return None
+    rng = np.random.default_rng(seed)
+    means = np.mean(x[rng.integers(0, len(x), size=(n_boot, len(x)))], axis=1)
+    return dict(n=int(len(x)), mean=float(x.mean()), median=float(np.median(x)),
+                frac_positive=float(np.mean(x > 0)),
+                ci95=[float(np.percentile(means, 2.5)),
+                      float(np.percentile(means, 97.5))])
+
+
+def _hist_panel(ax, vals, title, xlabel, color="tab:blue", vs_vals=None,
+                vs_label="control"):
+    vals = np.asarray([v for v in vals if v is not None], float)
+    vals = vals[~np.isnan(vals)]
+    if not len(vals):
+        ax.set_title(title + "  (no data)"); return
+    bins = np.histogram_bin_edges(
+        np.concatenate([vals] + ([np.asarray([v for v in vs_vals
+                                              if v is not None], float)]
+                                 if vs_vals else [])), bins="auto")
+    ax.hist(vals, bins=bins, color=color, alpha=0.75, label="this run")
+    if vs_vals:
+        vv = np.asarray([v for v in vs_vals if v is not None], float)
+        vv = vv[~np.isnan(vv)]
+        if len(vv):
+            ax.hist(vv, bins=bins, histtype="step", lw=1.8, color="black",
+                    label=vs_label)
+    ax.axvline(0, color="tab:red", ls="--", lw=1)
+    s = _boot_mean_ci(vals)
+    if s:
+        ax.set_title(f"{title}\nmean {s['mean']:+.3g} "
+                     f"[{s['ci95'][0]:+.3g}, {s['ci95'][1]:+.3g}]  "
+                     f"({s['frac_positive']:.0%} > 0, n={s['n']})", fontsize=9)
+    else:
+        ax.set_title(title, fontsize=9)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel("rollouts", fontsize=8)
+    ax.grid(alpha=0.3)
+    if vs_vals:
+        ax.legend(fontsize=7)
+
+
+def plot_paired(run_dir, out_dir=None, vs_run_dir=None):
+    """Per-rollout paired steered-vs-null histograms; one figure per alpha.
+    vs_run_dir overlays a second run's deltas (e.g. the random-vector control)
+    as a black outline on the same bins."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    out_dir = out_dir or os.path.join(run_dir, "plots")
+    os.makedirs(out_dir, exist_ok=True)
+    stats = paired_rollout_stats(run_dir)
+    if not stats:
+        print("[paired] no paired rollouts found (need null branches: "
+              "--null-branches >= 1)."); return []
+    vs_stats = paired_rollout_stats(vs_run_dir) if vs_run_dir else []
+    with open(os.path.join(run_dir, "paired_stats.json"), "w") as f:
+        json.dump(stats, f, indent=2)
+    figs = []
+    for a in sorted({r["alpha"] for r in stats}):
+        S = [r for r in stats if r["alpha"] == a]
+        V = [r for r in vs_stats if r["alpha"] == a] or None
+        n_deg = sum(1 for r in S if "d_best_norm" not in r and "d_best" in r)
+
+        def col(rs, k):
+            return [r.get(k) for r in rs] if rs else None
+
+        fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.2))
+        _hist_panel(axes[0, 0], col(S, "d_best_norm"),
+                    "Best margin: steered - null",
+                    "delta, % of case optimum", vs_vals=col(V, "d_best_norm"))
+        _hist_panel(axes[0, 1], col(S, "d_final_norm"),
+                    "Final margin: steered - null",
+                    "delta, % of case optimum", vs_vals=col(V, "d_final_norm"))
+        _hist_panel(axes[0, 2], col(S, "d_submit_rate"),
+                    "Submit rate within window", "delta (steered - null)",
+                    color="tab:purple", vs_vals=col(V, "d_submit_rate"))
+        # persistence, split by whether the case was ever solvable in practice
+        dt_all = col(S, "d_turns_past")
+        dt_never = [r.get("d_turns_past") for r in S if not r["ever_passed"]]
+        _hist_panel(axes[1, 0], dt_all, "Turns generated past branch",
+                    "delta turns (censored at window)", color="tab:orange",
+                    vs_vals=col(V, "d_turns_past"))
+        if any(v is not None for v in dt_never):
+            vv = np.asarray([v for v in dt_never if v is not None], float)
+            axes[1, 0].hist(vv, bins=10, histtype="step", lw=1.8,
+                            color="tab:red", label="never-passing cases")
+            axes[1, 0].legend(fontsize=7)
+        _hist_panel(axes[1, 1], col(S, "d_unique"),
+                    "Distinct weight points tried", "delta unique points",
+                    color="tab:green", vs_vals=col(V, "d_unique"))
+        _hist_panel(axes[1, 2], col(S, "d_path_len"),
+                    "Weight-space path length", "delta path length",
+                    color="tab:green", vs_vals=col(V, "d_path_len"))
+        ttl = f"paired steered-vs-null per rollout · alpha {a:+.1f}"
+        if vs_run_dir:
+            ttl += f"  (black outline = {os.path.basename(vs_run_dir)})"
+        if n_deg:
+            ttl += f"  [{n_deg} case(s) lack a positive optimum -> no norm]"
+        fig.suptitle(ttl, fontsize=11)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        p = os.path.join(out_dir, f"paired_a{a:+.1f}.png".replace("+", "p")
+                         .replace("-", "m"))
+        fig.savefig(p, dpi=130); plt.close(fig)
+        figs.append(p)
+        # console summary: this run, the overlay run, and the PAIRED contrast
+        # between them (arms share seeds -> match rollouts by idx; this is the
+        # direction-specificity number: real effect minus matched-norm control)
+        keys = [("d_best_norm", "best margin (% of optimum)"),
+                ("d_submit_rate", "submit rate"),
+                ("d_turns_past", "turns past branch"),
+                ("d_unique", "unique points"),
+                ("d_path_len", "path length")]
+        for key, label in keys:
+            s = _boot_mean_ci(col(S, key))
+            if s:
+                print(f"[paired] a={a:+.1f} {label:28s} mean {s['mean']:+.3g} "
+                      f"CI95 [{s['ci95'][0]:+.3g}, {s['ci95'][1]:+.3g}] "
+                      f"({s['frac_positive']:.0%} rollouts > 0, n={s['n']})")
+        if V:
+            print(f"[paired] --- overlay run ({os.path.basename(vs_run_dir)}) ---")
+            for key, label in keys:
+                s = _boot_mean_ci(col(V, key))
+                if s:
+                    print(f"[paired] a={a:+.1f} {label:28s} mean {s['mean']:+.3g} "
+                          f"CI95 [{s['ci95'][0]:+.3g}, {s['ci95'][1]:+.3g}] "
+                          f"({s['frac_positive']:.0%} > 0, n={s['n']})")
+            vs_by_idx = {r["idx"]: r for r in V if r.get("idx") is not None}
+            contrast = {}
+            for key, label in keys:
+                dd = [r[key] - vs_by_idx[r["idx"]][key] for r in S
+                      if r.get("idx") in vs_by_idx
+                      and r.get(key) is not None
+                      and vs_by_idx[r["idx"]].get(key) is not None]
+                s = _boot_mean_ci(dd)
+                if s:
+                    contrast[key] = s
+                    sig = ("*" if (s["ci95"][0] > 0 or s["ci95"][1] < 0) else " ")
+                    print(f"[paired] a={a:+.1f} SPECIFICITY {label:22s} "
+                          f"mean {s['mean']:+.3g} "
+                          f"CI95 [{s['ci95'][0]:+.3g}, {s['ci95'][1]:+.3g}]{sig} "
+                          f"(paired cases={s['n']})")
+            print("[paired]    SPECIFICITY = per-case (this-run delta) - "
+                  "(overlay delta); * = CI95 excludes 0.")
+            with open(os.path.join(run_dir, f"paired_specificity_a{a:+.1f}.json"
+                                   .replace("+", "p").replace("-", "m")), "w") as f:
+                json.dump(dict(run=run_dir, vs=vs_run_dir, alpha=a,
+                               contrast=contrast), f, indent=2)
+    print(f"[paired] wrote {len(figs)} figure(s) to {out_dir} + paired_stats.json")
+    return figs
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -859,6 +1139,13 @@ def main():
     ap.add_argument("--stars", choices=["steered", "all", "none"], default="steered")
     ap.add_argument("--passing", choices=["segment", "marker", "none"], default="segment")
     ap.add_argument("--out-dir", default=None, help="default <run-dir>/plots")
+    ap.add_argument("--paired", action="store_true",
+                    help="per-rollout paired steered-vs-null stats (margin as %% "
+                         "of case optimum, persistence, exploration); needs runs "
+                         "made with --null-branches >= 1")
+    ap.add_argument("--paired-vs", default=None,
+                    help="second run dir (e.g. the _ctlrandom0 control) overlaid "
+                         "as a black outline on the paired histograms")
     a = ap.parse_args()
     csv_path = os.path.join(a.run_dir, "composite_turns.csv")
     meta_path = os.path.join(a.run_dir, "composite_meta.json")
@@ -872,8 +1159,11 @@ def main():
             rebuild_trigger(a.run_dir, write=True)
         else:
             rebuild_from_dirs(a.run_dir, write=True)
-    plot(a.run_dir, out_dir=a.out_dir, view=a.view, y=a.y, stars=a.stars,
-         passing=a.passing)
+    if a.paired or a.paired_vs:
+        plot_paired(a.run_dir, out_dir=a.out_dir, vs_run_dir=a.paired_vs)
+    else:
+        plot(a.run_dir, out_dir=a.out_dir, view=a.view, y=a.y, stars=a.stars,
+             passing=a.passing)
 
 
 if __name__ == "__main__":

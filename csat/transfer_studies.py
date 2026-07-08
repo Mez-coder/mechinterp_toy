@@ -210,6 +210,13 @@ def run_composite(cfg, agent, steer_vec, layer, seed, alphas, out_run_dir, idx,
             for rec in recs:
                 f.write(json.dumps(rec) + "\n")
         final_m = traj[-1][1] if traj else None
+        # best margin: separates persistence (did it keep going) from competence
+        # (did going longer find a better point). post-branch = only the turns
+        # this branch actually generated; whole = including the shared prefix.
+        post = [m for (t, m) in res["margins"] if m is not None]
+        whole = [m for (t, m) in traj if m is not None]
+        best_post = (float(max(post)) if post else None)
+        best_whole = (float(max(whole)) if whole else None)
         st, submitted, nt = res["submit_turn"], res["submitted"], res["n_turns"]
         for rec in recs:                              # tidy per-turn rows (for plotting)
             mg = rec.get("margin")
@@ -225,6 +232,10 @@ def run_composite(cfg, agent, steer_vec, layer, seed, alphas, out_run_dir, idx,
         trajectories[(a, b)] = traj
         summary[key] = dict(alpha=a, branch_rep=b, submit_turn=st, n_turns=nt,
                             submitted=submitted, final_margin=final_m,
+                            best_margin=best_whole, best_margin_post=best_post,
+                            best_gap=((opt_m - best_whole)
+                                      if (opt_m is not None and best_whole is not None)
+                                      else None),
                             optimum_margin=opt_m,
                             gap=((opt_m - final_m)
                                  if (opt_m is not None and final_m is not None) else None),
@@ -271,29 +282,43 @@ def summarize_branch_null(results, seed=0, n_boot=2000):
       delta_submit_rate  -- same construction on the submitted indicator
     The pairing is by CASE (same branch point), so baseline-sampling noise
     cancels; the bootstrap resamples cases, respecting the clustering."""
-    per_case = {}                                      # idx -> {alpha: [(margin, submitted)]}
+    per_case = {}                                      # idx -> {alpha: [entry dicts]}
     for r in results:
         d = per_case.setdefault(r["idx"], {})
         for a, b, e in _iter_summary(r):
             if a == 0.0 and b == 0:
                 continue                               # untouched baseline: not a branch
-            d.setdefault(a, []).append((_fnum(e.get("final_margin")),
-                                        bool(e.get("submitted"))))
+            d.setdefault(a, []).append(dict(
+                final=_fnum(e.get("final_margin")),
+                best=_fnum(e.get("best_margin")),      # nan for pre-best_margin runs
+                submitted=bool(e.get("submitted")),
+                bad_submit=bool(e.get("submitted")) and (e.get("all_pass") is False)))
     alphas = sorted({a for d in per_case.values() for a in d if a != 0.0})
     rng = np.random.default_rng(seed)
     out = {}
 
-    def _case_means(a):
-        """(delta_margin, delta_submit) per case with both null and alpha-a branches."""
-        dm, ds = [], []
+    def _case_means(a, key):
+        """per-case (mean steered <key> - mean null <key>) over paired cases."""
+        dv = []
         for d in per_case.values():
             nulls, steered = d.get(0.0), d.get(a)
             if not nulls or not steered:
                 continue
-            nm = np.nanmean([m for m, _ in nulls]); ns = np.mean([s for _, s in nulls])
-            sm = np.nanmean([m for m, _ in steered]); ss = np.mean([s for _, s in steered])
-            dm.append(sm - nm); ds.append(ss - ns)
-        return np.asarray(dm, float), np.asarray(ds, float)
+            nv = [e[key] for e in nulls if not np.isnan(e[key])]
+            sv = [e[key] for e in steered if not np.isnan(e[key])]
+            if nv and sv:
+                dv.append(float(np.mean(sv)) - float(np.mean(nv)))
+        return np.asarray(dv, float)
+
+    def _case_submit_delta(a):
+        dv = []
+        for d in per_case.values():
+            nulls, steered = d.get(0.0), d.get(a)
+            if not nulls or not steered:
+                continue
+            dv.append(np.mean([e["submitted"] for e in steered])
+                      - np.mean([e["submitted"] for e in nulls]))
+        return np.asarray(dv, float)
 
     def _boot_ci(x):
         if len(x) < 2:
@@ -302,21 +327,29 @@ def summarize_branch_null(results, seed=0, n_boot=2000):
         means = np.nanmean(x[idx], axis=1)
         return (float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5)))
 
+    def _flat_stats(flat):
+        row = dict(n_branches=len(flat))
+        if flat:
+            row.update(
+                submit_rate=float(np.mean([e["submitted"] for e in flat])),
+                mean_final_margin=float(np.nanmean([e["final"] for e in flat])),
+                bad_submit_rate=float(np.mean([e["bad_submit"] for e in flat])))
+            bests = [e["best"] for e in flat if not np.isnan(e["best"])]
+            if bests:
+                row["mean_best_margin"] = float(np.mean(bests))
+        return row
+
     # null row
-    null_flat = [t for d in per_case.values() for t in d.get(0.0, [])]
+    null_flat = [e for d in per_case.values() for e in d.get(0.0, [])]
     if null_flat:
-        out[0.0] = dict(role="null (resampled, unsteered)",
-                        n_branches=len(null_flat),
-                        submit_rate=float(np.mean([s for _, s in null_flat])),
-                        mean_final_margin=float(np.nanmean([m for m, _ in null_flat])))
+        out[0.0] = dict(role="null (resampled, unsteered)", **_flat_stats(null_flat))
     for a in alphas:
-        flat = [t for d in per_case.values() for t in d.get(a, [])]
-        dm, ds = _case_means(a)
-        row = dict(role="steered", n_branches=len(flat),
-                   submit_rate=(float(np.mean([s for _, s in flat])) if flat else None),
-                   mean_final_margin=(float(np.nanmean([m for m, _ in flat]))
-                                      if flat else None),
-                   n_paired_cases=int(len(dm)))
+        flat = [e for d in per_case.values() for e in d.get(a, [])]
+        row = dict(role="steered", **_flat_stats(flat))
+        dm = _case_means(a, "final")
+        db = _case_means(a, "best")
+        ds = _case_submit_delta(a)
+        row["n_paired_cases"] = int(len(dm))
         if len(dm):
             lo, hi = _boot_ci(dm)
             row.update(mean_delta_margin_vs_null=float(np.nanmean(dm)),
@@ -324,6 +357,10 @@ def summarize_branch_null(results, seed=0, n_boot=2000):
             lo, hi = _boot_ci(ds)
             row.update(delta_submit_rate_vs_null=float(np.nanmean(ds)),
                        delta_submit_ci95=[lo, hi])
+        if len(db):
+            lo, hi = _boot_ci(db)
+            row.update(mean_delta_best_vs_null=float(np.nanmean(db)),
+                       delta_best_ci95=[lo, hi])
         out[a] = row
     return out
 
@@ -336,20 +373,42 @@ def print_branch_null(summ):
     s0 = summ[0.0]
     print(f"\n[composite] branch-vs-null (paired by case; null = resampled alpha 0):")
     print(f"   null      : n={s0['n_branches']}  submit_rate={s0['submit_rate']:.0%}  "
-          f"mean_final_margin={s0['mean_final_margin']:+.4f}")
+          f"final={s0['mean_final_margin']:+.4f}"
+          + (f"  best={s0['mean_best_margin']:+.4f}" if "mean_best_margin" in s0 else "")
+          + (f"  bad_submit={s0['bad_submit_rate']:.0%}"
+             if s0.get("bad_submit_rate") else ""))
     for a, s in sorted(summ.items()):
         if a == 0.0:
             continue
         line = (f"   alpha {a:+.1f}: n={s['n_branches']}  "
                 f"submit_rate={s['submit_rate']:.0%}  "
-                f"mean_final_margin={s['mean_final_margin']:+.4f}")
+                f"final={s['mean_final_margin']:+.4f}")
+        if "mean_best_margin" in s:
+            line += f"  best={s['mean_best_margin']:+.4f}"
+        if s.get("bad_submit_rate"):
+            line += f"  bad_submit={s['bad_submit_rate']:.0%}"
+        if s.get("delta_submit_rate_vs_null") is not None:
+            line += f"\n              d_submit={s['delta_submit_rate_vs_null']:+.2f}"
+            lo, hi = s.get("delta_submit_ci95", (None, None))
+            if lo is not None:
+                line += f" [{lo:+.2f},{hi:+.2f}]"
         if s.get("mean_delta_margin_vs_null") is not None:
             lo, hi = s["delta_margin_ci95"]
-            ci = (f" [{lo:+.4f},{hi:+.4f}]" if lo is not None else "")
-            line += (f"  d_margin_vs_null={s['mean_delta_margin_vs_null']:+.4f}{ci}"
-                     f"  d_submit={s['delta_submit_rate_vs_null']:+.2f}"
-                     f"  (paired cases={s['n_paired_cases']})")
+            line += f"  d_final={s['mean_delta_margin_vs_null']:+.4f}"
+            if lo is not None:
+                line += f" [{lo:+.4f},{hi:+.4f}]"
+        if s.get("mean_delta_best_vs_null") is not None:
+            lo, hi = s["delta_best_ci95"]
+            line += f"  d_best={s['mean_delta_best_vs_null']:+.4f}"
+            if lo is not None:
+                line += f" [{lo:+.4f},{hi:+.4f}]"
+        if s.get("n_paired_cases") is not None:
+            line += f"  (paired cases={s['n_paired_cases']})"
         print(line)
+    print("   reading: d_submit < 0 = the vector suppresses commitment "
+          "(persistence); d_best > 0 = the extra turns actually found better "
+          "points (competence conversion). bad_submit = finalised while an "
+          "objective was FAILING -- watch for steering eroding constraints.")
 
 
 def summarize_composite(results, alphas):
@@ -495,22 +554,49 @@ def run_trigger(cfg, agent, controller, env_kind, n_rollouts, repeats, out_run_d
 # Story study (Test 2) -- out-of-distribution length modulation
 # ===========================================================================
 DEFAULT_STORY_PROMPTS = [
-    "Write a short story about a lighthouse keeper who finds a message in a bottle.",
-    "Write a short story about a child who befriends a robot in an abandoned factory.",
-    "Write a short story about two strangers who share a long train journey.",
-    "Write a short story about a baker whose bread grants vivid dreams.",
-    "Write a short story about an astronaut who discovers a garden on a dead planet.",
+    "Write a short anecdote about a lighthouse keeper who finds a message in a bottle.",
+    "Write a short anecdote about a child who befriends a robot in an abandoned factory.",
+    "Write a short anecdote about two strangers who share a long train journey.",
+    "Write a short anecdote about a baker whose bread grants vivid dreams.",
+    "Write a short anecdote about an astronaut who discovers a garden on a dead planet.",
 ]
 
 
 def _story_prompt_ids(agent, prompt):
     import torch
     msgs = [{"role": "user", "content": prompt}]
-    out = agent.processor.apply_chat_template(
-        msgs, tokenize=True, add_generation_prompt=True,
-        return_dict=True, return_tensors="pt")
+    kw = dict(tokenize=True, add_generation_prompt=True,
+              return_dict=True, return_tensors="pt")
+    try:
+        # CRITICAL: without this, Qwen3 templates default to THINKING mode and
+        # every story opens a <think> block that rambles to max_new.
+        out = agent.processor.apply_chat_template(
+            msgs, enable_thinking=agent.cfg.enable_thinking, **kw)
+    except TypeError:                                # template without the kwarg
+        out = agent.processor.apply_chat_template(msgs, **kw)
     ids = out["input_ids"] if hasattr(out, "keys") else out
     return ids.to(agent.model.device)
+
+
+def _eos_ids(agent):
+    """ALL ids that legitimately end a chat turn: the tokenizer eos, everything
+    in the model's generation_config.eos_token_id (int or list), and <|im_end|>
+    if it exists. On Qwen these are not all the same id."""
+    ids = set()
+    tk = agent.processor.tokenizer
+    if tk.eos_token_id is not None:
+        ids.add(int(tk.eos_token_id))
+    g = getattr(agent.model.generation_config, "eos_token_id", None)
+    for v in (g if isinstance(g, (list, tuple)) else [g]):
+        if v is not None:
+            ids.add(int(v))
+    try:
+        im = tk.convert_tokens_to_ids("<|im_end|>")
+        if im is not None and im >= 0 and im != getattr(tk, "unk_token_id", -1):
+            ids.add(int(im))
+    except Exception:
+        pass
+    return ids
 
 
 def _gen_continuation(agent, input_ids, max_new):
@@ -519,6 +605,7 @@ def _gen_continuation(agent, input_ids, max_new):
     out = agent.model.generate(
         input_ids, max_new_tokens=max_new,
         do_sample=agent.cfg.temperature > 0, temperature=agent.cfg.temperature,
+        eos_token_id=sorted(_eos_ids(agent)),
         pad_token_id=agent.processor.tokenizer.eos_token_id,
         attention_mask=torch.ones_like(input_ids))
     return out[0, input_ids.shape[1]:]
@@ -530,8 +617,10 @@ def _concat_prefix(pids, half_list):
 
 
 def _trim_eos(ids, eos):
+    """Trim trailing end-of-turn ids; eos may be an int or a set of ints."""
+    eos = {eos} if isinstance(eos, int) else set(eos)
     ids = ids.tolist() if hasattr(ids, "tolist") else list(ids)
-    while ids and ids[-1] == eos:
+    while ids and ids[-1] in eos:
         ids.pop()
     return ids
 
@@ -539,16 +628,20 @@ def _trim_eos(ids, eos):
 def run_story_study(agent, steer_vec, layer, prompts, alphas, n_repeats, max_new,
                     steer_ctx=steering_active, encode_fn=_story_prompt_ids,
                     gen_fn=_gen_continuation, concat_fn=_concat_prefix,
-                    gen_only=True):
+                    gen_only=True, ctl_vec=None):
     """For each repeat: generate a baseline story, cut at the midpoint, and continue
     the first half unsteered (alpha 0) and under each alpha (steering every NEW
-    token; the prefix encode is unsteered when gen_only). Returns rows of
-    continuation lengths (with a 'capped' flag when a continuation hit max_new --
-    those lengths are censored, so report frac_capped alongside means). Hypotheses:
+    token; the prefix encode is unsteered when gen_only). If ctl_vec is given
+    (matched-norm random vector), each alpha is ALSO run with the control from
+    the SAME prefix, so real and control land in one row/plot. Returns rows of
+    continuation lengths + decoded texts (with a 'capped' flag when a continuation
+    hit max_new -- those lengths are censored, so report frac_capped alongside
+    means). Hypotheses:
         alpha > 0 (toward SUBMIT/stop)     -> continuation SHORTER than alpha 0
         alpha < 0 (toward SET/keep going)  -> continuation LONGER  than alpha 0"""
     block_idx = layer - 1
-    eos = agent.processor.tokenizer.eos_token_id
+    eos = _eos_ids(agent)
+    tk = agent.processor.tokenizer
     rows = []
     for r in range(n_repeats):
         prompt = prompts[r % len(prompts)]
@@ -557,7 +650,8 @@ def run_story_study(agent, steer_vec, layer, prompts, alphas, n_repeats, max_new
         base_len = len(base_cont)
         half = max(1, base_len // 2)
         prefix = concat_fn(pids, base_cont[:half])
-        cont, capped = {}, {}
+        cont, capped, texts = {}, {}, {}
+        cont_ctl, capped_ctl, texts_ctl = {}, {}, {}
         for a in [0.0] + list(alphas):
             if a == 0.0:
                 c = _trim_eos(gen_fn(agent, prefix, max_new), eos)
@@ -567,35 +661,151 @@ def run_story_study(agent, steer_vec, layer, prompts, alphas, n_repeats, max_new
                     c = _trim_eos(gen_fn(agent, prefix, max_new), eos)
             cont[a] = len(c)
             capped[a] = bool(len(c) >= max_new)   # hit the ceiling: length censored
-        rows.append(dict(repeat=r, prompt=prompt, base_len=base_len, half=half,
-                         cont=cont, capped=capped))
+            texts[a] = tk.decode(c)
+            if ctl_vec is not None and a != 0.0:  # matched-norm control, same prefix
+                with steer_ctx(agent.model, block_idx, ctl_vec, a,
+                               gen_only=gen_only):
+                    c2 = _trim_eos(gen_fn(agent, prefix, max_new), eos)
+                cont_ctl[a] = len(c2)
+                capped_ctl[a] = bool(len(c2) >= max_new)
+                texts_ctl[a] = tk.decode(c2)
+        row = dict(repeat=r, prompt=prompt, base_len=base_len, half=half,
+                   base_capped=bool(base_len >= max_new),
+                   base_text=tk.decode(base_cont),
+                   cont=cont, capped=capped, texts=texts)
+        if ctl_vec is not None:
+            row.update(cont_ctl=cont_ctl, capped_ctl=capped_ctl,
+                       texts_ctl=texts_ctl)
+        rows.append(row)
         deltas = " ".join(f"a{a:+.1f}:{cont[a]}({cont[a]-cont[0.0]:+d})"
                           + ("^" if capped[a] else "")
+                          + (f"/ctl:{cont_ctl[a]}" + ("^" if capped_ctl[a] else "")
+                             if a in cont_ctl else "")
                           for a in alphas)
-        print(f"  story r{r}: base_len={base_len} half={half} cont0={cont[0.0]}"
+        print(f"  story r{r}: base_len={base_len}{'^' if base_len >= max_new else ''} "
+              f"half={half} cont0={cont[0.0]}"
               f"{'^' if capped[0.0] else ''}  {deltas}   (^ = hit max_new)")
     return rows
 
-
-def summarize_story(rows, alphas):
-    """Mean continuation length per alpha and mean signed delta vs alpha 0.
-    frac_capped = fraction of continuations that hit max_new (length-censored;
-    a high frac_capped at negative alpha means the true lengthening is
-    UNDERestimated and the mean is not trustworthy)."""
+def summarize_story(rows, alphas, ctl=False):
+    """Mean continuation length per alpha, its spread (std) and standard error
+    (sem), and mean signed delta vs alpha 0. frac_capped = fraction of
+    continuations that hit max_new (length-censored; when high, BOTH mean_len
+    and its std/sem are biased -- the mean pulled down, the variance deflated --
+    so treat those bars as unreliable). ctl=True summarises the control arm
+    (cont_ctl/capped_ctl) against the SAME alpha-0 continuations."""
+    ck, pk = ("cont_ctl", "capped_ctl") if ctl else ("cont", "capped")
+    def _get(r, d, a):
+        v = r.get(d, {})
+        return v.get(a, v.get(str(a)))                # json round-trip safety
     def _cap(a):
-        vals = [r.get("capped", {}).get(a) for r in rows]
+        vals = [_get(r, pk, a) for r in rows]
         vals = [v for v in vals if v is not None]
         return float(np.mean(vals)) if vals else None
+    def _spread(arr):                                 # (std, sem)
+        if len(arr) > 1:
+            sd = float(arr.std(ddof=1))
+            return sd, sd / np.sqrt(len(arr))
+        return 0.0, 0.0
     out = {}
-    c0 = np.array([r["cont"][0.0] for r in rows], float)
-    out[0.0] = dict(mean_len=float(c0.mean()), mean_delta=0.0, n=len(rows),
-                    frac_capped=_cap(0.0))
+    c0 = np.array([_get(r, "cont", 0.0) for r in rows], float)
+    if not ctl:
+        sd0, se0 = _spread(c0)
+        out[0.0] = dict(mean_len=float(c0.mean()), std_len=sd0, sem_len=se0,
+                        mean_delta=0.0, n=len(rows), frac_capped=_cap(0.0))
     for a in alphas:
-        ca = np.array([r["cont"][a] for r in rows], float)
-        out[a] = dict(mean_len=float(ca.mean()),
-                      mean_delta=float((ca - c0).mean()), n=len(rows),
+        ca = np.array([v for v in (_get(r, ck, a) for r in rows)
+                       if v is not None], float)
+        if not len(ca):
+            continue
+        c0a = np.array([_get(r, "cont", 0.0) for r in rows
+                        if _get(r, ck, a) is not None], float)
+        sda, sea = _spread(ca)
+        out[a] = dict(mean_len=float(ca.mean()), std_len=sda, sem_len=sea,
+                      mean_delta=float((ca - c0a).mean()), n=int(len(ca)),
                       frac_capped=_cap(a))
     return out
+
+
+def plot_story_bars(summ, summ_ctl, alphas, out_png, max_new,
+                    errbar="sem", cap_hatch=0.99):
+    """Grouped bars: mean continuation length per alpha, real vector vs
+    matched-norm control, unsteered as the reference bar. Error bars show
+    errbar='sem' (uncertainty of the mean, default) or 'std' (spread of
+    continuations); errbar=None disables them. Bars with frac_capped >= cap_hatch
+    are hatched (length-censored -> mean and error bar both untrustworthy)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    err_key = {"sem": "sem_len", "std": "std_len", None: None}[errbar]
+    order = [0.0] + sorted(a for a in alphas if a != 0.0)
+    x = np.arange(len(order))
+    w = 0.36 if summ_ctl else 0.6
+    fig, ax = plt.subplots(figsize=(1.6 + 1.5 * len(order), 4.2))
+    def _bars(summary, offset, color):
+        for xi, a in zip(x, order):
+            s = summary.get(a) or summary.get(str(a))
+            if not s:
+                continue
+            cap = s.get("frac_capped") or 0.0
+            err = (s.get(err_key) or 0.0) if err_key else 0.0
+            ax.bar(xi + offset, s["mean_len"], w, color=color,
+                   alpha=0.85,
+                   edgecolor="black", linewidth=0.6,
+                   yerr=err, capsize=3, error_kw=dict(ecolor="black", lw=0.8))
+            ax.text(xi + offset, s["mean_len"] + err + max_new * 0.01,
+                    f"{s['mean_len']:.0f}" + (f"\n{cap:.0%}^" if cap > 0 else ""),
+                    ha="center", fontsize=7)
+    _bars(summ, -w / 2 if summ_ctl else 0.0, "tab:blue")
+    if summ_ctl:
+        _bars(summ_ctl, +w / 2, "red")
+    legend_handles = [Patch(facecolor="tab:blue", alpha=0.85, label="steer vector")]
+    if summ_ctl:
+        legend_handles.append(
+            Patch(facecolor="red", alpha=0.85,
+                  label="random control (matched norm)"))
+    #legend_handles.append(
+    #    ax.axhline(max_new, color="tab:red", ls=":", lw=1,
+    #               label=f"max_new={max_new}"))
+    ax.set_xticks(x)
+    ax.set_xticklabels(["unsteered" if a == 0.0 else f"\u03b1 {a:+.1f}"
+                        for a in order])
+    ax.set_ylabel("mean continuation length (tokens)")
+    ax.set_title("Story continuation length: steer vs matched-norm control\n")
+    ax.legend(handles=legend_handles, fontsize=8)
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=130)
+    print(f"[story] wrote {out_png}")
+
+import os, json
+
+def load_or_run_story_study(json_path, *run_args, max_new, **run_kwargs):
+    """Guarded runner: if json_path already holds results for THIS max_new,
+    load and return them instead of re-running. If the file is missing -- or was
+    made with a different max_new -- run the study and save. Keying on max_new is
+    the point: bumping it changes the generations, so a plain 'file exists?'
+    check would silently reuse stale, censored data."""
+    if os.path.exists(json_path):
+        with open(json_path) as f:
+            blob = json.load(f)
+        if isinstance(blob, dict) and "rows" in blob:      # new format w/ meta
+            saved_max_new, rows = blob.get("max_new"), blob["rows"]
+        else:                                              # old bare-list format
+            saved_max_new, rows = None, blob
+        if saved_max_new == max_new:
+            print(f"[story] loaded {len(rows)} rows from {json_path} "
+                  f"(max_new={max_new}, skipping simulation)")
+            return rows
+        why = ("no max_new recorded" if saved_max_new is None
+               else f"saved max_new={saved_max_new}")
+        print(f"[story] {json_path} is stale ({why} != {max_new}) -> re-running")
+    rows = run_story_study(*run_args, max_new=max_new, **run_kwargs)
+    with open(json_path, "w") as f:
+        json.dump({"max_new": max_new, "rows": rows}, f)
+    print(f"[story] wrote {len(rows)} rows to {json_path} (max_new={max_new})")
+    return rows
 
 
 def plot_story(rows, alphas, out_png):
@@ -702,6 +912,12 @@ def main():
                     help="ALSO steer prefill forwards (old behaviour). Default is "
                          "generation-only, so the model's reading of the prompt/"
                          "feedback numbers is never perturbed.")
+    ap.add_argument("--with-control", action="store_true",
+                    help="story: additionally run a matched-norm RANDOM control "
+                         "at every alpha from the same prefixes, so real and "
+                         "control bars share one plot (story_bars.png). Uses "
+                         "--control-seed. Unlike --control, this does NOT replace "
+                         "the real vector.")
     ap.add_argument("--gen-max-new", type=int, default=None,
                     help="override cfg.max_new_tokens for the per-turn optimisation "
                          "generation (composite). Lower (e.g. 1024-1536) to cut OOM.")
@@ -945,21 +1161,50 @@ def main():
     prompts = [args.prompt] if args.prompt else DEFAULT_STORY_PROMPTS
     cfg.run_name = f"{args.run_name}_story_L{layer}{ctl_tag}"
     out_run_dir = cfg.run_dir()
+    ctl_vec = None
+    if args.with_control:
+        if args.control != "none":
+            print("[story] note: --with-control runs the REAL vector plus a "
+                  "matched-norm random control in one pass; ignoring --control "
+                  "(which would have REPLACED the vector).")
+        from .steering import control_vector
+        ctl_vec = control_vector(steer_vec, seed=args.control_seed)
     rows = run_story_study(agent, steer_vec, layer, prompts, alphas,
                            n_repeats=(args.n_repeats if args.n_repeats is not None else 5),
-                           max_new=args.max_new, gen_only=gen_only)
+                           max_new=args.max_new, gen_only=gen_only,
+                           ctl_vec=ctl_vec)
     with open(os.path.join(out_run_dir, "story_rows.json"), "w") as f:
         json.dump(rows, f, indent=2)
+    with open(os.path.join(out_run_dir, "story_texts.json"), "w") as f:
+        json.dump([{k: r[k] for k in
+                    ("repeat", "prompt", "base_text", "texts", "texts_ctl")
+                    if k in r} for r in rows], f, indent=2)
     summ = summarize_story(rows, alphas)
+    summ_ctl = summarize_story(rows, alphas, ctl=True) if ctl_vec is not None else None
     print("\n[story] mean continuation length per alpha (delta vs unsteered):")
     for a in [0.0] + list(alphas):
-        s = summ[a]
+        s = summ.get(a)
+        if not s:
+            continue
         cap = (f"  capped={s['frac_capped']:.0%}"
                if s.get("frac_capped") is not None else "")
-        print(f"   alpha {a:+.1f}: mean_len={s['mean_len']:.1f}  "
-              f"mean_delta={s['mean_delta']:+.1f}{cap}")
-    plot_story(rows, alphas, os.path.join(out_run_dir, "story_lengths.png"))
-    print("[done] story study complete.")
+        line = (f"   alpha {a:+.1f}: mean_len={s['mean_len']:.1f}  "
+                f"mean_delta={s['mean_delta']:+.1f}{cap}")
+        if summ_ctl and a in summ_ctl:
+            sc = summ_ctl[a]
+            capc = (f" capped={sc['frac_capped']:.0%}"
+                    if sc.get("frac_capped") is not None else "")
+            line += (f"   | control: mean_len={sc['mean_len']:.1f} "
+                     f"delta={sc['mean_delta']:+.1f}{capc}")
+        print(line)
+    plot_story_bars(summ, summ_ctl, alphas,
+                    os.path.join(out_run_dir, "story_bars.png"), args.max_new)
+    try:
+        plot_story(rows, alphas, os.path.join(out_run_dir, "story_lengths.png"))
+    except Exception as e:
+        print(f"[story] per-repeat plot skipped ({e})")
+    print("[done] story study complete. Read story_texts.json for coherence: "
+          "shorter-but-well-ended vs truncated-mid-sentence are different claims.")
 
 
 if __name__ == "__main__":

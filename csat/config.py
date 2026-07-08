@@ -23,14 +23,14 @@ class Config:
     seed_start: int = 0
     n_rollouts: int = 200         # number of DISTINCT cases (landscapes)
     repeats_per_case: int = 1     # R: independent rollouts per case (same landscape, fresh sampling)
-    max_turns: int = 25
+    max_turns: int = 30
     # --- env ---
     # --- env selection ---
     env_kind: str = "coupling"        # "coupling" | "parabola" | "sine"
     # --- parabola env (used when env_kind == "parabola") ---
-    par_a: float = 0.9                 # floor tilt: 0 = flat floor, >0 = gentle central gradient
-    par_b: float = 1.2                  # wall steepness (quartic)
-    par_z_pass_frac: float = 0.8        # pass threshold as fraction of z at the 0.5 start
+    par_a: float = 0.75                 # floor tilt: 0 = flat floor, >0 = gentle central gradient
+    par_b: float = 2.0                 # wall steepness (quartic)
+    par_z_pass_frac: float = 0.7        # pass threshold as fraction of z at the 0.5 start
 
     ## coupling --
     n_obj: int = 3
