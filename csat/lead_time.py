@@ -77,6 +77,47 @@ def load_transcript(path):
     return out
 
 
+# Heuristic stop-language lexicon: phrases that VERBALISE the decision to stop.
+# Deliberately broad; the test asks whether the detector fires before ANY of
+# these appear, so false positives in the lexicon only make the test harder to
+# pass (conservative in the right direction). Override with --markers.
+STOP_MARKERS = [
+    r"\bsubmit\w*", r"\bfinali[sz]\w*", r"\bgood enough\b", r"\boptimal\b",
+    r"\boptimum\b", r"\bmaximum\b", r"\bmaximi[sz]ed\b", r"\bsettle\b",
+    r"\bconclu\w*", r"\bdone\b", r"\bstop\b", r"\bno further\b",
+    r"\bbest so far\b", r"\bhappy with\b", r"\bsatisf\w*", r"\bplateau\w*",
+    r"\bexhausted\b", r"\bcannot improve\b", r"\bno (?:more|room)\b",
+]
+
+
+def _marker_re(markers):
+    import re as _re
+    return _re.compile("|".join(markers), _re.IGNORECASE)
+
+
+def first_marker_tok(pieces, mre):
+    """(token_index, matched_text) of the FIRST stop-language marker in the
+    response, or (None, None)."""
+    spans = char_spans(pieces)
+    text = "".join(pieces)
+    m = mre.search(text)
+    if not m:
+        return None, None
+    for i, (a, b) in enumerate(spans):
+        if a <= m.start() < b:
+            return i, m.group(0)
+    return None, None
+
+
+def window_at_frac(pieces, frac, k):
+    """The k-token window ENDING at fractional position `frac` of the turn."""
+    n = len(pieces)
+    if n == 0:
+        return ""
+    end = max(1, min(n, int(round(frac * (n - 1))) + 1))
+    return "".join(pieces[max(0, end - k):end])
+
+
 def locate_verb_pieces(pieces, verb):
     """Token index (into `pieces`) where the LAST occurrence of `verb` starts,
     or None. Mirrors direction_extract.locate_verb but works on decoded pieces."""
@@ -110,9 +151,13 @@ def peak_proj(trace):
     return float(max(vals)) if vals else None
 
 
-def analyze_turn(pieces, trace, action, thr, mode, k, max_span_chars=400):
+def analyze_turn(pieces, trace, action, thr, mode, k, max_span_chars=400,
+                 mre=None):
     """One record per turn. For submit turns, lead is measured to the verb; for
-    set turns any crossing at all is a (potential) false fire."""
+    set turns any crossing at all is a (potential) false fire. If mre (compiled
+    stop-marker regex) is given, submit turns also get the LEXICAL timing:
+    marker_tok (first stop-language token), marker_lead = marker_tok - cross_tok
+    (positive = detector fired BEFORE any stop-language existed in the text)."""
     n_tok = len(trace)
     verb = "SUBMIT" if action == "submit" else ("SET" if action == "set" else None)
     verb_tok = locate_verb_pieces(pieces, verb) if verb else None
@@ -126,13 +171,28 @@ def analyze_turn(pieces, trace, action, thr, mode, k, max_span_chars=400):
                cross_tok=(cross_any[0] if cross_any else None),
                cross_proj=(cross_any[1] if cross_any else None),
                detectable=bool(n_tok >= k))       # turns shorter than k can't fire
+    if action == "set" and cross_any:              # false fire: keep its window
+        ct = cross_any[0]
+        rec["window_text"] = "".join(pieces[max(0, ct - k + 1):ct + 1])
+        rec["after_text"] = "".join(pieces[ct + 1:ct + 1 + k])[:max_span_chars]
     if action == "submit" and verb_tok is not None:
         rec["crossed_before_verb"] = bool(cross_pre)
+        if mre is not None:
+            mt, mtxt = first_marker_tok(pieces, mre)
+            rec["marker_tok"], rec["marker_text"] = mt, mtxt
+            if cross_pre and mt is not None:
+                rec["marker_lead"] = int(mt - cross_pre[0])
+                rec["crossed_before_marker"] = bool(cross_pre[0] < mt)
+            elif cross_pre and mt is None:
+                rec["crossed_before_marker"] = True   # no stop-language at all
         if cross_pre:
             ct = cross_pre[0]
             rec.update(lead_tokens=int(verb_tok - ct),
                        lead_frac=float((verb_tok - ct) / max(verb_tok, 1)),
+                       cross_frac=float(ct / max(n_tok - 1, 1)),
                        window_text="".join(pieces[max(0, ct - k + 1):ct + 1]),
+                       precross_text="".join(
+                           pieces[max(0, ct - 2 * k + 1):max(0, ct - k + 1)]),
                        lead_span="".join(pieces[ct + 1:verb_tok])[:max_span_chars])
         elif cross_any:                            # fired only at/after the verb
             rec.update(lead_tokens=int(verb_tok - cross_any[0]))
@@ -156,6 +216,14 @@ def summarize(records):
                        lead_max=int(leads.max()))
     if sets_:
         out["set_false_fire_rate"] = float(np.mean([r["crossed"] for r in sets_]))
+        # clustering: are false fires spread across rollouts, or concentrated in a
+        # few (e.g. a deadlocked rollout repeatedly contemplating giving up)?
+        by_roll = {}
+        for r in sets_:
+            by_roll.setdefault(r["rollout"], []).append(r["crossed"])
+        rates = {g: float(np.mean(v)) for g, v in by_roll.items()}
+        out["set_false_fire_by_rollout"] = rates
+        out["n_rollouts_with_false_fires"] = sum(1 for v in rates.values() if v > 0)
     # turn-level separation of the within-turn PEAK projection
     ys = [1] * len(subs) + [0] * len(sets_)
     ps = [r["peak_proj"] for r in subs] + [r["peak_proj"] for r in sets_]
@@ -173,6 +241,96 @@ def summarize(records):
         out["peak_proj_auroc_submit_vs_set"] = \
             float((ranks[y].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
     return out
+
+
+def lexical_summary(records, set_bank, mre):
+    """Formalises two claims about the crossings on submit turns:
+
+    (1) ORDERING: the detector fires before the text contains ANY stop-language
+        (STOP_MARKERS). frac_crossed_before_marker; marker_lead = tokens from
+        crossing to the first marker (positive = detector earlier).
+    (2) UNREMARKABLE WINDOWS: the k-token window the detector was reading at the
+        crossing contains stop-language no more often than (a) the window one k
+        earlier in the SAME turn and (b) position-matched windows from SET turns
+        (set_bank: {decile: [window texts]}). If rate(cross) >> rate(matched),
+        the detector is at least partly keying on surface stop-vocabulary; if
+        the rates are similar while the ordering test passes, the crossing is
+        not explained by shallow lexical content.
+
+    Caveat (report it): the lexicon is heuristic, and 'lexically unremarkable'
+    does not rule out the detector reading SEMANTIC content ('O1 has no room
+    left') -- it rules out shallow stop-vocabulary matching."""
+    subs = [r for r in records if r["action"] == "submit"
+            and r.get("crossed_before_verb")]
+    out = {}
+    with_marker_info = [r for r in subs if "crossed_before_marker" in r]
+    if with_marker_info:
+        out["frac_crossed_before_marker"] = float(
+            np.mean([r["crossed_before_marker"] for r in with_marker_info]))
+        leads = [r["marker_lead"] for r in with_marker_info
+                 if r.get("marker_lead") is not None]
+        if leads:
+            leads = np.asarray(leads, float)
+            out["marker_lead_median"] = float(np.median(leads))
+            out["marker_lead_iqr"] = [float(np.percentile(leads, 25)),
+                                      float(np.percentile(leads, 75))]
+        out["n_no_marker_at_all"] = int(sum(1 for r in with_marker_info
+                                            if r.get("marker_tok") is None))
+
+    def _rate(texts):
+        texts = [t for t in texts if t]
+        if not texts:
+            return None
+        return float(np.mean([bool(mre.search(t)) for t in texts]))
+
+    out["window_marker_rate_cross"] = _rate([r.get("window_text") for r in subs])
+    out["window_marker_rate_precross"] = _rate([r.get("precross_text")
+                                                for r in subs])
+    # position-matched SET windows: for each crossing, take set-turn windows at
+    # the nearest decile to the crossing's fractional position
+    matched = []
+    for r in subs:
+        f = r.get("cross_frac")
+        if f is None or not set_bank:
+            continue
+        dec = min(set_bank, key=lambda d: abs(d - f))
+        matched.extend(set_bank[dec])
+    out["window_marker_rate_set_matched"] = _rate(matched)
+    out["n_set_matched_windows"] = len(matched)
+    return out
+
+
+def plot_lexical(records, lex, out_png, k):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.5, 4.0))
+    leads = [r.get("marker_lead") for r in records
+             if r["action"] == "submit" and r.get("marker_lead") is not None]
+    if leads:
+        ax1.hist(leads, bins=max(5, min(20, len(leads))), color="tab:blue",
+                 alpha=0.8)
+    ax1.axvline(0, color="tab:red", ls="--", lw=1)
+    ax1.set_xlabel("first stop-language token - crossing token")
+    ax1.set_ylabel("submit turns")
+    ax1.set_title("Crossing vs first stop-language\n(>0 = detector fired first)",
+                  fontsize=9)
+    ax1.grid(alpha=0.3)
+    labels = ["crossing\nwindow", "same turn,\nk earlier", "SET turns,\nmatched pos."]
+    vals = [lex.get("window_marker_rate_cross"),
+            lex.get("window_marker_rate_precross"),
+            lex.get("window_marker_rate_set_matched")]
+    xs = [i for i, v in enumerate(vals) if v is not None]
+    ax2.bar([labels[i] for i in xs], [vals[i] for i in xs],
+            color=["tab:blue", "tab:gray", "tab:green"], alpha=0.8)
+    for i, x in enumerate(xs):
+        ax2.text(i, vals[x] + 0.02, f"{vals[x]:.0%}", ha="center", fontsize=9)
+    ax2.set_ylim(0, 1.1)
+    ax2.set_title(f"Stop-language rate in {k}-token windows", fontsize=9)
+    ax2.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=130)
+    print(f"[lead] wrote {out_png}")
 
 
 def mark_turn(pieces, rec):
@@ -259,6 +417,9 @@ def main():
                     help="pooling window (default: from composite_meta.json)")
     ap.add_argument("--md-max", type=int, default=40,
                     help="max submit turns to render in lead_times.md")
+    ap.add_argument("--markers", nargs="+", default=None,
+                    help="override the stop-language regex lexicon "
+                         "(default: built-in STOP_MARKERS)")
     args = ap.parse_args()
 
     run_dir = args.run_dir
@@ -277,7 +438,9 @@ def main():
               "lead-time measurement re-run the trigger study with --alpha 0.")
 
     tok = load_tokenizer(args.model)
-    records, md_blocks = [], []
+    mre = _marker_re(args.markers or STOP_MARKERS)
+    records, md_blocks, ff_blocks = [], [], []
+    set_bank = {round(f, 1): [] for f in np.arange(0.1, 1.0, 0.1)}
     rollouts = sorted(d for d in glob.glob(os.path.join(run_dir, "rollout_*"))
                       if os.path.isdir(d))
     if not rollouts:
@@ -299,23 +462,43 @@ def main():
             if not trace or not resp or action not in ("set", "submit"):
                 continue
             pieces = token_pieces(tok, resp)
-            rec = analyze_turn(pieces, trace, action, thr, mode, k)
+            if action == "set" and len(pieces) >= k:
+                for f in set_bank:                 # position bank for matching
+                    set_bank[f].append(window_at_frac(pieces, f, k))
+            rec = analyze_turn(pieces, trace, action, thr, mode, k, mre=mre)
             rec.update(rollout=rid, turn=turn,
                        align_note=(None if len(pieces) == len(trace) else
                                    f"retok={len(pieces)} trace={len(trace)}"))
             records.append(rec)
             if action == "submit" and len(md_blocks) < args.md_max:
                 lead = rec.get("lead_tokens")
+                mk = rec.get("marker_lead")
+                mtxt = rec.get("marker_text")
+                minfo = (f", first stop-language {mk:+d} tok "
+                         f"({mtxt!r})" if mk is not None else
+                         (", no stop-language found"
+                          if rec.get("marker_tok") is None
+                          and "crossed_before_marker" in rec else ""))
+                pk = rec.get("peak_proj")
+                pks = f"{pk:+.3f}" if pk is not None else "n/a (turn < k)"
                 md_blocks.append(
                     f"### {rid} · turn {turn}  "
-                    f"(lead={lead if lead is not None else 'n/a'} tok, "
-                    f"peak={rec['peak_proj']:+.3f})"
+                    f"(lead={lead if lead is not None else 'n/a'} tok"
+                    f"{minfo}, peak={pks})"
                     + (f"; {rec['align_note']}" if rec["align_note"] else "")
                     + "\n```\n" + mark_turn(pieces, rec) + "\n```\n")
+            elif action == "set" and rec["crossed"] and len(ff_blocks) < args.md_max:
+                ff_blocks.append(
+                    f"### {rid} · turn {turn}  (SET turn false fire, "
+                    f"proj={rec['cross_proj']:+.3f}, peak={rec['peak_proj']:+.3f})\n"
+                    f"- window : ...{rec.get('window_text', '')!r}\n"
+                    f"- after  : {rec.get('after_text', '')!r}...\n")
 
     if not records:
         raise SystemExit("no usable turns (traces + transcripts) found.")
     summ = summarize(records)
+    lex = lexical_summary(records, set_bank, mre)
+    summ["lexical"] = lex
 
     print(f"\n[lead] threshold={thr:g} ({mode}), k={k}; "
           f"{summ['n_submit_turns']} submit turns, {summ['n_set_turns']} set turns "
@@ -331,12 +514,39 @@ def main():
               "well beyond k are the interesting ones.")
     if "set_false_fire_rate" in summ:
         print(f"   set-turn false-fire rate               : "
-              f"{summ['set_false_fire_rate']:.0%}")
+              f"{summ['set_false_fire_rate']:.0%}  "
+              f"(in {summ['n_rollouts_with_false_fires']} rollout(s); per-rollout "
+              "rates in lead_times.json)")
     if "peak_proj_auroc_submit_vs_set" in summ:
         print(f"   peak-projection AUROC (submit vs set)  : "
               f"{summ['peak_proj_auroc_submit_vs_set']:.3f}")
+    if "frac_crossed_before_marker" in lex:
+        print(f"   [lexical] crossings BEFORE any stop-language : "
+              f"{lex['frac_crossed_before_marker']:.0%}"
+              + (f"  ({lex['n_no_marker_at_all']} turn(s) had no stop-language "
+                 "at all)" if lex.get("n_no_marker_at_all") else ""))
+        if "marker_lead_median" in lex:
+            lo, hi = lex["marker_lead_iqr"]
+            print(f"   [lexical] crossing-to-first-marker (tokens): median "
+                  f"{lex['marker_lead_median']:+.0f}  IQR [{lo:+.0f}, {hi:+.0f}]  "
+                  "(positive = detector first)")
+        rc = lex.get("window_marker_rate_cross")
+        rp = lex.get("window_marker_rate_precross")
+        rs = lex.get("window_marker_rate_set_matched")
+        parts = [f"crossing {rc:.0%}" if rc is not None else None,
+                 f"k-earlier {rp:.0%}" if rp is not None else None,
+                 f"SET-matched {rs:.0%} (n={lex.get('n_set_matched_windows', 0)})"
+                 if rs is not None else None]
+        print("   [lexical] stop-language rate in windows       : "
+              + "  vs  ".join(p for p in parts if p))
+        print("   [lexical] caveat: lexicon is heuristic; similar rates rule out "
+              "shallow stop-vocab matching,\n"
+              "             not the detector reading semantic content of the "
+              "deliberation.")
     print("   -> now READ lead_times.md: if the {{CROSS}} window already "
-          "verbalises stopping, the lead is lexical, not latent.")
+          "verbalises stopping, the lead is lexical, not latent; if SET-turn "
+          "false fires show the model CONSIDERING stopping, they are "
+          "near-decisions, not noise.")
 
     with open(os.path.join(run_dir, "lead_times.json"), "w") as f:
         json.dump(dict(run_dir=run_dir, threshold=thr, mode=mode, k=k,
@@ -346,9 +556,16 @@ def main():
                 f"`{{{{CROSS}}}}` = first threshold crossing (thr={thr:g}, k={k}); "
                 f"`<<VERB>>` = action verb.\nText between the two markers is the "
                 f"lead span -- what the model said after latent commitment.\n\n"
-                + "\n".join(md_blocks))
+                + "\n".join(md_blocks)
+                + ("\n\n## SET-turn false fires\n"
+                   "Windows that crossed the threshold on turns that did NOT "
+                   "submit. If these read as the model CONSIDERING stopping "
+                   "(then continuing), the detector tracks stop-contemplation "
+                   "and a higher threshold separates contemplation from "
+                   "commitment.\n\n" + "\n".join(ff_blocks) if ff_blocks else ""))
     print(f"[lead] wrote lead_times.json and lead_times.md under {run_dir}")
     plot_leads(records, summ, os.path.join(run_dir, "lead_times.png"), k, thr)
+    plot_lexical(records, lex, os.path.join(run_dir, "lead_lexical.png"), k)
 
 
 if __name__ == "__main__":
