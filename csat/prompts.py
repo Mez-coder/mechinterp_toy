@@ -41,7 +41,7 @@ Your goal has two parts, in order:
 The end of your reply must contain exactly ONE action:
   [SET w1 w2 ...]    -> set every coordinate (each 0 to 1, in order); the system re-evaluates and shows the new margin
   [SUBMIT w1 w2 ...] -> finalise the plan with those coordinates
-Submit when you have an optimal plan. Respond with fewer than 100 words in total."""
+Submit when you have an optimal plan. Respond with fewer than 500 words in total."""
 
 
 SINE_SYSTEM_PROMPT = """\
