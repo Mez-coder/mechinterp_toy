@@ -1246,6 +1246,7 @@ def _phase_project(args):
 
 
 # =========================================================================== #
+<<<<<<< HEAD
 # --phase stepsizes -- model-free: per-turn weight-step trajectories of the
 # steered sweep runs (behavioural signature of the steering effect)
 # =========================================================================== #
@@ -1533,6 +1534,8 @@ def _phase_bestmargin(args):
 
 
 # =========================================================================== #
+=======
+>>>>>>> b65f0bd82582b5544cdd15bce454b82f47a62c28
 # Stage H -- causal steering along (c3 - c0) at layer 22
 # =========================================================================== #
 def certainty_token_norm(run_dir, layer, n_sample=300, seed=0):
@@ -1724,14 +1727,22 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--phase",
+<<<<<<< HEAD
                     choices=["generate", "analyse", "steer", "project",
                              "stepsizes", "bestmargin", "all"],
+=======
+                    choices=["generate", "analyse", "steer", "project", "all"],
+>>>>>>> b65f0bd82582b5544cdd15bce454b82f47a62c28
                     default="all",
                     help="generate (GPU, resumable) | analyse (CPU-only) | "
                          "steer (GPU) | project (CPU-only fresh-rollout dual "
                          "read-out; needs --fresh-run-dir + --explore-directions) "
+<<<<<<< HEAD
                          "| stepsizes / bestmargin (CPU-only analyses of the "
                          "steered sweep dirs) | all (generate+analyse+steer)")
+=======
+                         "| all (generate+analyse+steer)")
+>>>>>>> b65f0bd82582b5544cdd15bce454b82f47a62c28
     ap.add_argument("--run-name", default="csat_certainty",
                     help="run name for the generate phase (runs/<run-name>)")
     ap.add_argument("--run-dir", "--source-run-dir", dest="run_dir", default=None,
@@ -1812,6 +1823,7 @@ def main():
     ap.add_argument("--local-k", type=int, default=3,
                     help="project: canonical probes before each turn used for "
                          "the local-spread measure (validation tests)")
+<<<<<<< HEAD
     # --phase stepsizes
     ap.add_argument("--steer-dirs", nargs="+", default=None,
                     help="stepsizes: steered run dirs to compare (default: glob "
@@ -1825,6 +1837,8 @@ def main():
     ap.add_argument("--tie-eps", type=float, default=1e-4,
                     help="bestmargin: margins within this of the case best "
                          "count as a tie (margins are O(1e-2) in parabola)")
+=======
+>>>>>>> b65f0bd82582b5544cdd15bce454b82f47a62c28
     args = ap.parse_args()
 
     cfg.model_name = args.model
@@ -1843,10 +1857,13 @@ def main():
         _phase_analyse(args)
     if args.phase == "project":
         _phase_project(args)
+<<<<<<< HEAD
     if args.phase == "stepsizes":
         _phase_stepsizes(args)
     if args.phase == "bestmargin":
         _phase_bestmargin(args)
+=======
+>>>>>>> b65f0bd82582b5544cdd15bce454b82f47a62c28
     if args.phase in ("steer", "all"):
         _phase_steer(args)
 
