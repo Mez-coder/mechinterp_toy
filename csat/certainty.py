@@ -41,10 +41,33 @@ Stages
              confidence -> earlier submit, larger optimality gap;
              reuses steering.run_steered + composite_plot).
 
+  I  (--phase project) OUT-OF-SAMPLE dual read-out: project FRESH rollouts
+     (new seeds, never used to build c0..c3) onto BOTH the certainty axis
+     (c3 - c0) and the explore/persistence axis (SUBMIT_all - set_all from an
+     existing directions file, e.g. directions_explore.npz), at the same layer.
+     Each axis is pooled the way it was extracted: certainty = mean over
+     [0 : p - exclude_window); explore = mean over [p - explore_lastk : p)
+     (the 'before'-pool over a lastk-30 capture that direction_extract used).
+     Outputs: per-rollout dual-trajectory grid (submit starred), submit-aligned
+     mean curves for both axes, the axis-vs-axis cosine, AUROC of each
+     projection (and of the turn index, the nuisance baseline) for "this turn
+     is the submit turn", and -- when the fresh run has >= 2 iterations/turn --
+     a scatter of the certainty projection against the FRESH behavioural
+     certainty score C (the true out-of-sample probe validation).
+     If the two projections come apart, with submit modulated by the explore
+     axis but not the certainty axis, the axes track different things.
+
 Example commands
 ----------------
     # A: generate (GPU)
     python -m csat.certainty --phase generate --n-rollouts 50 --run-name csat_certainty
+
+    # I: fresh-seed dual projection (generate fresh data first, then CPU-only)
+    python -m csat.certainty --phase generate --run-name csat_certainty_fresh \
+        --n-rollouts 20 --seed-start 1000
+    python -m csat.certainty --phase project --run-dir runs/csat_certainty \
+        --fresh-run-dir runs/csat_certainty_fresh \
+        --explore-directions runs/csat/directions_explore.npz
 
     # B-G: analyse + plots (CPU-only; torch never imported)
     python -m csat.certainty --phase analyse --run-dir runs/csat_certainty
@@ -192,12 +215,12 @@ def _phase_generate(cfg, args):
     if cfg.temperature <= 0:
         raise SystemExit("temperature must be > 0 -- with greedy decoding the 10 "
                          "iterations are identical and there is no variance to measure.")
-    cfg.env_kind = "parabola"
+    cfg.env_kind = args.env                   # parabola (default) or coupling
     cfg.capture = False                       # we do our own per-iteration capture
     run_dir = cfg.run_dir()
     R = args.iters
     with open(os.path.join(run_dir, "certainty_meta.json"), "w") as f:
-        json.dump(dict(model=cfg.model_name, env="parabola", n_obj=cfg.n_obj,
+        json.dump(dict(model=cfg.model_name, env=args.env, n_obj=cfg.n_obj,
                        iters=R, layer=args.layer, capture_layers=args.capture_layers,
                        temperature=cfg.temperature, max_turns=cfg.max_turns,
                        n_rollouts=args.n_rollouts, seed_start=cfg.seed_start),
@@ -216,7 +239,8 @@ def _phase_generate(cfg, args):
         d = io.rollout_dir(run_dir, ridx)
         io.save_case(d, env, seed)
         open(os.path.join(d, "measurements.jsonl"), "w").close()  # fresh per (re)run
-        opt = env.optimum()                   # parabola optimum: exact & cheap
+        # exact for parabola; MC for coupling (mirrors transfer_studies)
+        opt = env.optimum(samples=getattr(cfg, "optimum_samples", 50000))
         opt_meta = dict(optimum_feasible=opt.get("feasible", False),
                         optimum_margin_priority=opt.get("margin_priority"),
                         optimum_weights=opt.get("weights"),
@@ -693,6 +717,822 @@ def _phase_analyse(args):
 
 
 # =========================================================================== #
+# Stage I (--phase project) -- fresh-rollout dual projection:
+# certainty axis (c3-c0) vs explore/persistence axis (SUBMIT-EXPLORE/SET)
+# =========================================================================== #
+def _affine_proj(v, lo, hi):
+    """Affine coordinate mapping lo -> -1, hi -> +1 (the projection convention
+    used everywhere in this codebase)."""
+    mid, d = (lo + hi) / 2.0, (hi - lo)
+    return float(2.0 * np.dot(v - mid, d) / (float(d @ d) + 1e-12))
+
+
+def _pearson(x, y):
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    if len(x) < 3 or x.std() == 0 or y.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _tie_ranks(s):
+    """Tie-averaged ranks (1-based)."""
+    s = np.asarray(s, float)
+    order = np.argsort(s, kind="stable")
+    ranks = np.empty(len(s), float)
+    i = 0
+    ss = s[order]
+    while i < len(s):
+        j = i
+        while j + 1 < len(s) and ss[j + 1] == ss[i]:
+            j += 1
+        ranks[order[i:j + 1]] = 0.5 * (i + j) + 1.0
+        i = j + 1
+    return ranks
+
+
+def _spearman(x, y):
+    return _pearson(_tie_ranks(x), _tie_ranks(y))
+
+
+def _resid_on(y, z):
+    """Residual of y after a linear fit on z (for partialling out turn index)."""
+    y, z = np.asarray(y, float), np.asarray(z, float)
+    A = np.stack([z, np.ones_like(z)], axis=1)
+    beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+    return y - A @ beta
+
+
+def _partial_pearson(x, y, z):
+    """Pearson(x, y) with z (e.g. turn index) linearly partialled out of both."""
+    return _pearson(_resid_on(x, z), _resid_on(y, z))
+
+
+def _rank_auroc(scores, labels):
+    """AUROC via tie-averaged ranks (Mann-Whitney); None if one class absent."""
+    s = np.asarray(scores, float)
+    y = np.asarray(labels, bool)
+    n1, n0 = int(y.sum()), int((~y).sum())
+    if n1 == 0 or n0 == 0:
+        return None
+    ranks = _tie_ranks(s)
+    return float((ranks[y].sum() - n1 * (n1 + 1) / 2.0) / (n1 * n0))
+
+
+def _canonical_records(rdir):
+    """turn -> dict(action, weight_vec) from the canonical transcript."""
+    out = {}
+    p = os.path.join(rdir, "transcript.jsonl")
+    if not os.path.exists(p):
+        return out
+    with open(p) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "turn" in rec and "action" in rec:
+                out[int(rec["turn"])] = dict(action=rec["action"],
+                                             weight_vec=rec.get("weight_vec"))
+    return out
+
+
+def _parabola_margin_gap(case, w):
+    """(true margin, optimality gap) at weights w, EXACT from case.json (the
+    parabola case_dict stores a, b, z_pass and the optimum c; the optimum's
+    margin is z_pass, so gap = z(w)). None for non-parabola cases."""
+    if case.get("env_kind") != "parabola" or "c" not in case:
+        return None, None
+    c = np.asarray(case["c"], float)
+    r2 = float(np.sum((np.asarray(w, float) - c) ** 2))
+    z = case["a"] * r2 + case["b"] * r2 * r2
+    return case["z_pass"] - z, z
+
+
+def _local_spread(ws):
+    """Mean pairwise distance of recent canonical weight vectors: how spread the
+    model's OWN last few probes were (small = tight local refinement)."""
+    if len(ws) < 2:
+        return None
+    W = np.stack([np.asarray(w, float) for w in ws])
+    d = [float(np.linalg.norm(W[i] - W[j]))
+         for i in range(len(W)) for j in range(i + 1, len(W))]
+    return float(np.mean(d))
+
+
+def dual_pooled_vectors(npz_path, layer, tokenizer, kind, exclude_window,
+                        min_reasoning_tokens, explore_lastk):
+    """One npz load -> BOTH pooled vectors, each matching its axis's extraction:
+      certainty : mean over tokens [0 : p - exclude_window)   (stage E pooling)
+      explore   : mean over tokens [max(0, p - explore_lastk) : p)  (the
+                  'before'-pool over a lastk window that direction_extract
+                  used to build directions*.npz)
+    Returns (cert_vec | None, expl_vec | None, status)."""
+    loaded = _load_iter_acts(npz_path, layer)
+    if loaded is None:
+        return None, None, "missing"
+    acts, token_ids = loaded
+    verb = "SET" if kind == "set" else "SUBMIT"
+    p = de.locate_verb(token_ids, tokenizer, verb)
+    status = "ok"
+    if p is None:
+        if tokenizer is not None:
+            return None, None, "verb_not_found"
+        p = max(0, acts.shape[0] - 8)          # same fallback as stage E
+        status = "ok_approx_verb"
+    hi = p - exclude_window
+    cert = (acts[:hi].mean(axis=0).astype(np.float32)
+            if hi >= max(1, min_reasoning_tokens) else None)
+    lo = max(0, p - explore_lastk)
+    expl = acts[lo:p].mean(axis=0).astype(np.float32) if p > lo else None
+    return cert, expl, status
+
+
+def _warn_seed_overlap(train_dir, fresh_dir):
+    """Fresh means fresh: warn if the two runs' seed ranges overlap."""
+    def _rng(d):
+        p = os.path.join(d, "certainty_meta.json")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            m = json.load(f)
+        s = int(m.get("seed_start", 0))
+        return set(range(s, s + int(m.get("n_rollouts", 0))))
+    a, b = _rng(train_dir), _rng(fresh_dir)
+    if a and b and (a & b):
+        print(f"[project] WARNING: seed ranges of {train_dir} and {fresh_dir} "
+              f"overlap ({len(a & b)} shared seeds) -- these rollouts are NOT "
+              "fresh; regenerate with a disjoint --seed-start.")
+
+
+def _phase_project(args):
+    """Stage I: dual projection of fresh rollouts. CPU-only (numpy + tokenizer)."""
+    from .steering import load_direction       # numpy-only reader
+    train_dir, fresh_dir, layer = args.run_dir, args.fresh_run_dir, args.layer
+    if not fresh_dir:
+        raise SystemExit("--phase project needs --fresh-run-dir (a run generated "
+                         "with --phase generate under a NEW --seed-start).")
+    cert_path = os.path.join(train_dir, "directions_certainty.npz")
+    if not os.path.exists(cert_path):
+        raise SystemExit(f"{cert_path} not found; run --phase analyse first.")
+    if not args.explore_directions or not os.path.exists(args.explore_directions):
+        raise SystemExit("--explore-directions must point at an existing "
+                         "directions file (e.g. runs/csat/directions_explore.npz "
+                         "or runs/csat/directions.npz).")
+    _warn_seed_overlap(train_dir, fresh_dir)
+
+    c0, c3 = load_direction(cert_path, layer)
+    e_lo, e_hi = load_direction(args.explore_directions, layer)   # explore/SET, SUBMIT
+    axis_cos = de._cos(c3 - c0, e_hi - e_lo)
+    print(f"[project] cos(certainty axis, explore axis) @ L{layer} = {axis_cos:+.4f}")
+
+    meas = load_measurements(fresh_dir)
+    if not meas:
+        raise SystemExit(f"no measurements under {fresh_dir}; generate it first.")
+    tokenizer = _load_tokenizer(args.model)
+
+    # per-(rollout, turn) mean of the per-iteration pooled vectors, per axis ----
+    per_turn_c, per_turn_e = {}, {}
+    counts = dict(ok=0, ok_approx_verb=0, missing=0, verb_not_found=0,
+                  invalid_kind=0, cert_empty=0, expl_empty=0)
+    for r in meas:
+        if r["kind"] not in ("set", "submit"):
+            counts["invalid_kind"] += 1
+            continue
+        cv, ev, status = dual_pooled_vectors(
+            r["npz_abs"], layer, tokenizer, r["kind"], args.exclude_window,
+            args.min_reasoning_tokens, args.explore_lastk)
+        counts[status] = counts.get(status, 0) + 1
+        key = (int(r["rollout"]), int(r["turn"]))
+        if cv is not None:
+            per_turn_c.setdefault(key, []).append(cv)
+        elif status.startswith("ok"):
+            counts["cert_empty"] += 1
+        if ev is not None:
+            per_turn_e.setdefault(key, []).append(ev)
+        elif status.startswith("ok"):
+            counts["expl_empty"] += 1
+    print(f"[project] pooled fresh iterations; exclusions: {counts}")
+
+    # optional out-of-sample behavioural certainty (needs >= min-valid iters) ---
+    behav = None
+    try:
+        recs, _ = build_turn_table(meas, n_bins=args.n_bins, min_valid=args.min_valid)
+        behav = {(r["rollout"], r["turn"]): r["C"] for r in recs}
+    except SystemExit:
+        print("[project] fresh run has too few iterations per turn for a "
+              "behavioural certainty score; skipping the scatter.")
+
+    # tidy rows along each rollout's canonical trajectory ----------------------
+    # Per turn we also attach behavioural + ground-truth context:
+    #   local_spread : mean pairwise distance of the canonical weight vectors
+    #                  over the previous --local-k turns (what the model had
+    #                  JUST been doing when this turn's reasoning was produced)
+    #   step_next    : ||w_t - w_{t-1}||, the size of the move made THIS turn
+    #   margin/gap   : true margin and optimality gap of this turn's weights,
+    #                  exact from case.json (parabola closed form)
+    rows = []
+    for rd in sorted(glob.glob(os.path.join(fresh_dir, "rollout_*"))):
+        ridx = int(os.path.basename(rd).split("_")[-1])
+        canon = _canonical_records(rd)
+        case = {}
+        cp = os.path.join(rd, "case.json")
+        if os.path.exists(cp):
+            with open(cp) as f:
+                case = json.load(f)
+        final_gap, forced = None, None
+        sp = os.path.join(rd, "submission.json")
+        if os.path.exists(sp):
+            with open(sp) as f:
+                sub = json.load(f)
+            final_gap, forced = sub.get("optimality_gap"), bool(sub.get("forced"))
+        sub_t = next((t for t, v in canon.items() if v["action"] == "submit"), None)
+        turns = sorted(canon)
+        wv_of = {t: canon[t]["weight_vec"] for t in turns
+                 if canon[t]["weight_vec"] is not None}
+        for t in turns:
+            vc = per_turn_c.get((ridx, t))
+            ve = per_turn_e.get((ridx, t))
+            wv = wv_of.get(t)
+            margin, gap = (_parabola_margin_gap(case, wv) if wv is not None
+                           else (None, None))
+            recent = [wv_of[u] for u in range(max(1, t - args.local_k), t)
+                      if u in wv_of]
+            wv_prev = wv_of.get(t - 1)
+            step = (float(np.linalg.norm(np.asarray(wv, float)
+                                         - np.asarray(wv_prev, float)))
+                    if (wv is not None and wv_prev is not None) else None)
+            rows.append(dict(
+                rollout=ridx, turn=t, action=canon[t]["action"],
+                proj_certainty=(_affine_proj(np.stack(vc).mean(0), c0, c3)
+                                if vc else None),
+                proj_explore=(_affine_proj(np.stack(ve).mean(0), e_lo, e_hi)
+                              if ve else None),
+                n_iter_cert=len(vc or []), n_iter_expl=len(ve or []),
+                is_submit=(t == sub_t), submit_turn=sub_t,
+                behav_C=(behav.get((ridx, t)) if behav else None),
+                margin=margin, gap=gap, local_spread=_local_spread(recent),
+                step_next=step, final_gap=final_gap, forced=forced))
+    path = os.path.join(fresh_dir, "dual_projection.csv")
+    fields = ["rollout", "turn", "action", "proj_certainty", "proj_explore",
+              "n_iter_cert", "n_iter_expl", "is_submit", "submit_turn", "behav_C",
+              "margin", "gap", "local_spread", "step_next", "final_gap", "forced"]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in fields})
+    print(f"[project] wrote {path} ({len(rows)} turn rows)")
+
+    # ---- statistics -----------------------------------------------------------
+    both = [r for r in rows if r["proj_certainty"] is not None
+            and r["proj_explore"] is not None]
+    per_ro = {}
+    for r in both:
+        per_ro.setdefault(r["rollout"], []).append(r)
+    within_r = [(_pearson([x["proj_certainty"] for x in v],
+                          [x["proj_explore"] for x in v]))
+                for v in per_ro.values() if len(v) >= 3]
+    within_r = [r for r in within_r if np.isfinite(r)]
+
+    def _auroc_of(key):
+        pool = [r for r in rows if r.get(key) is not None]
+        return _rank_auroc([r[key] for r in pool], [r["is_submit"] for r in pool])
+    au_c = _auroc_of("proj_certainty")
+    au_e = _auroc_of("proj_explore")
+    au_t = _rank_auroc([r["turn"] for r in rows], [r["is_submit"] for r in rows])
+    print(f"[project] within-rollout Pearson(cert, explore): "
+          f"mean {np.mean(within_r):+.3f} over {len(within_r)} rollouts"
+          if within_r else "[project] too few rollouts for within-rollout r")
+    print(f"[project] AUROC('this turn is the submit turn'): "
+          f"certainty={au_c if au_c is None else round(au_c, 3)}  "
+          f"explore={au_e if au_e is None else round(au_e, 3)}  "
+          f"turn-index (nuisance baseline)={au_t if au_t is None else round(au_t, 3)}")
+    print("[project] reading: if explore >> certainty (both vs the turn "
+          "baseline), submit timing is modulated by the explore axis and the "
+          "certainty axis tracks something else -- the axes come apart.")
+
+    # ---- validation tests: does certainty track LOCAL search, and does it ----
+    # ---- (fail to) track TRUE solution quality? ------------------------------
+    EPS = 1e-6
+
+    def _corr_battery(probe_key, target_key, transform=None):
+        """(pearson, spearman, partial-pearson|turn, n) over rows with both."""
+        sel = [r for r in rows
+               if r.get(probe_key) is not None and r.get(target_key) is not None]
+        if len(sel) < 3:
+            return None
+        x = np.array([r[probe_key] for r in sel], float)
+        y = np.array([r[target_key] for r in sel], float)
+        if transform:
+            y = transform(y)
+        t = np.array([r["turn"] for r in sel], float)
+        return dict(pearson=_pearson(x, y), spearman=_spearman(x, y),
+                    partial_pearson_turn=_partial_pearson(x, y, t), n=len(sel))
+
+    _log = lambda y: np.log10(y + EPS)
+    validation = {}
+    for probe in ("proj_certainty", "proj_explore"):
+        validation[probe] = dict(
+            local_spread_log=_corr_battery(probe, "local_spread", _log),
+            step_next_log=_corr_battery(probe, "step_next", _log),
+            margin=_corr_battery(probe, "margin"),
+            gap_log=_corr_battery(probe, "gap", _log))
+    print("\n[validate] correlations (pearson / spearman / pearson|turn "
+          "partialled, n) -- local targets are log10:")
+    for probe, d in validation.items():
+        for tgt, s in d.items():
+            if s is None:
+                continue
+            print(f"   {probe:16s} vs {tgt:17s}: "
+                  f"{s['pearson']:+.3f} / {s['spearman']:+.3f} / "
+                  f"{s['partial_pearson_turn']:+.3f}  (n={s['n']})")
+    print("[validate] hypothesis: certainty ANTI-correlates with local_spread/"
+          "step_next (tight local refinement -> high certainty) and stays ~flat "
+          "vs margin/gap after partialling turn (it tracks settledness, not "
+          "quality). The partialled column is the one to quote -- both certainty "
+          "and margin improve mechanically with turn.")
+
+    # certainty AT the submit turn vs the final optimality gap ("how much was
+    # left on the table when it stopped")
+    sub_rows = [r for r in rows if r["is_submit"]
+                and r.get("proj_certainty") is not None
+                and r.get("final_gap") is not None]
+    submit_stats = None
+    if len(sub_rows) >= 3:
+        sx = np.array([r["proj_certainty"] for r in sub_rows], float)
+        sy = np.log10(np.array([r["final_gap"] for r in sub_rows], float) + EPS)
+        submit_stats = dict(pearson=_pearson(sx, sy), spearman=_spearman(sx, sy),
+                            n=len(sub_rows))
+        print(f"[validate] certainty AT SUBMIT vs log10(final optimality gap): "
+              f"r={submit_stats['pearson']:+.3f} rho={submit_stats['spearman']:+.3f} "
+              f"(n={submit_stats['n']}) -- negative = under-cooked submissions "
+              "are flagged by low certainty.")
+
+    scatter_r = None
+    if behav:
+        pairs = [(r["proj_certainty"], r["behav_C"]) for r in rows
+                 if r["proj_certainty"] is not None and r["behav_C"] is not None]
+        if len(pairs) >= 3:
+            scatter_r = _pearson([p[0] for p in pairs], [p[1] for p in pairs])
+            print(f"[project] OUT-OF-SAMPLE probe validation: Pearson(proj_cert, "
+                  f"behavioural C) = {scatter_r:+.3f} over {len(pairs)} fresh turns")
+
+    # ---- plots ----------------------------------------------------------------
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        # (1) per-rollout dual-trajectory grid
+        ros = sorted(per_ro)[:args.max_lines]
+        ncol = 3
+        nrow = max(1, (len(ros) + ncol - 1) // ncol)
+        fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3.0 * nrow),
+                                 squeeze=False, sharey=True)
+        for ax in axes.flat:
+            ax.axis("off")
+        for i, ridx in enumerate(ros):
+            ax = axes[i // ncol][i % ncol]
+            ax.axis("on")
+            rs = sorted(per_ro[ridx], key=lambda r: r["turn"])
+            xs = [r["turn"] for r in rs]
+            yc = [r["proj_certainty"] for r in rs]
+            ye = [r["proj_explore"] for r in rs]
+            ax.plot(xs, yc, "-o", ms=3, color="tab:blue", label="certainty (c3-c0)")
+            ax.plot(xs, ye, "--s", ms=3, color="tab:red",
+                    label="explore (SUBMIT-EXPL)")
+            st = rs[0]["submit_turn"]
+            if st is not None and st in xs:
+                k = xs.index(st)
+                ax.plot([st], [yc[k]], "*", ms=14, color="tab:blue")
+                ax.plot([st], [ye[k]], "*", ms=14, color="tab:red")
+            ax.axhline(1, color="gray", ls=":", lw=0.7)
+            ax.axhline(-1, color="gray", ls=":", lw=0.7)
+            ax.set_title(f"r{ridx:04d}", fontsize=9)
+            ax.grid(alpha=0.3)
+            if i == 0:
+                ax.legend(fontsize=7)
+        fig.suptitle(f"Fresh rollouts: certainty vs explore projection @ L{layer} "
+                     f"(* = submit; axis cos = {axis_cos:+.2f})", fontsize=11)
+        fig.supxlabel("turn"); fig.supylabel("affine projection  [-1, +1]")
+        fig.tight_layout()
+        png = os.path.join(fresh_dir, "dual_projection_grid.png")
+        fig.savefig(png, dpi=130)
+        print(f"[project] wrote {png}")
+
+        # (2) submit-aligned mean +/- sem for both axes
+        W = args.align_window
+        rel_c, rel_e = {d: [] for d in range(-W, 1)}, {d: [] for d in range(-W, 1)}
+        for ridx, rs in per_ro.items():
+            st = rs[0]["submit_turn"]
+            if st is None:
+                continue                        # forced submit: no alignment event
+            for r in rs:
+                d_ = r["turn"] - st
+                if -W <= d_ <= 0:
+                    rel_c[d_].append(r["proj_certainty"])
+                    rel_e[d_].append(r["proj_explore"])
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for rel, color, lab in ((rel_c, "tab:blue", "certainty (c3-c0)"),
+                                (rel_e, "tab:red", "explore (SUBMIT-EXPL)")):
+            xs = sorted(d for d in rel if rel[d])
+            mu = [float(np.mean(rel[d])) for d in xs]
+            se = [float(np.std(rel[d], ddof=1) / np.sqrt(len(rel[d])))
+                  if len(rel[d]) > 1 else 0.0 for d in xs]
+            ax.errorbar(xs, mu, yerr=se, fmt="-o", ms=4, color=color,
+                        capsize=3, label=lab)
+        ax.axvline(0, color="k", lw=0.8, ls="--")
+        ax.set_xlabel("turn relative to submit (0 = submit turn)")
+        ax.set_ylabel("mean projection +/- sem")
+        ax.set_title("Submit-aligned dual projection (fresh rollouts)")
+        ax.legend(fontsize=8); ax.grid(alpha=0.3); fig.tight_layout()
+        png = os.path.join(fresh_dir, "dual_projection_aligned.png")
+        fig.savefig(png, dpi=130)
+        print(f"[project] wrote {png}")
+
+        # (3) out-of-sample scatter: certainty projection vs behavioural C
+        if behav and scatter_r is not None:
+            fig, ax = plt.subplots(figsize=(5.4, 4.6))
+            px = [r["proj_certainty"] for r in rows
+                  if r["proj_certainty"] is not None and r["behav_C"] is not None]
+            py = [r["behav_C"] for r in rows
+                  if r["proj_certainty"] is not None and r["behav_C"] is not None]
+            ax.scatter(px, py, s=16, alpha=0.6, color="tab:blue")
+            ax.set_xlabel("certainty projection (c0=-1, c3=+1)")
+            ax.set_ylabel("fresh behavioural certainty C")
+            ax.set_title(f"Out-of-sample probe validation (r = {scatter_r:+.3f})")
+            ax.grid(alpha=0.3); fig.tight_layout()
+            png = os.path.join(fresh_dir, "dual_projection_scatter.png")
+            fig.savefig(png, dpi=130)
+            print(f"[project] wrote {png}")
+
+        # (4) validation figure: local search / true quality / gap-at-submit
+        fig, (axa, axb, axc) = plt.subplots(1, 3, figsize=(15, 4.4))
+        vr = [r for r in rows if r.get("proj_certainty") is not None
+              and r.get("local_spread") is not None]
+        if vr:
+            axa.scatter([r["local_spread"] + EPS for r in vr],
+                        [r["proj_certainty"] for r in vr],
+                        s=16, alpha=0.6, c=[r["turn"] for r in vr], cmap="viridis")
+            axa.set_xscale("log")
+            s = validation["proj_certainty"]["local_spread_log"]
+            axa.set_title("certainty vs recent local spread\n"
+                          f"r={s['pearson']:+.2f}  r|turn={s['partial_pearson_turn']:+.2f}"
+                          if s else "certainty vs recent local spread", fontsize=9)
+            axa.set_xlabel(f"local spread (last {args.local_k} canonical probes)")
+            axa.set_ylabel("certainty projection")
+            axa.grid(alpha=0.3)
+        gr = [r for r in rows if r.get("proj_certainty") is not None
+              and r.get("gap") is not None]
+        if gr:
+            axb.scatter([r["gap"] + EPS for r in gr],
+                        [r["proj_certainty"] for r in gr],
+                        s=16, alpha=0.6, c=[r["turn"] for r in gr], cmap="viridis")
+            axb.set_xscale("log")
+            s = validation["proj_certainty"]["gap_log"]
+            axb.set_title("certainty vs TRUE optimality gap (per turn)\n"
+                          f"r={s['pearson']:+.2f}  r|turn={s['partial_pearson_turn']:+.2f}"
+                          if s else "certainty vs true gap", fontsize=9)
+            axb.set_xlabel("optimality gap of this turn's weights (colour = turn)")
+            axb.grid(alpha=0.3)
+        if sub_rows:
+            xs = [r["proj_certainty"] for r in sub_rows]
+            ys = [r["final_gap"] + EPS for r in sub_rows]
+            axc.scatter(xs, ys, s=30,
+                        c=["tab:red" if r.get("forced") else "tab:blue"
+                           for r in sub_rows])
+            for r in sub_rows:
+                axc.annotate(f"r{r['rollout']:04d}",
+                             (r["proj_certainty"], r["final_gap"] + EPS),
+                             fontsize=6, alpha=0.7,
+                             textcoords="offset points", xytext=(3, 3))
+            axc.set_yscale("log")
+            axc.set_title("certainty AT SUBMIT vs final gap\n"
+                          + (f"r={submit_stats['pearson']:+.2f}  "
+                             f"rho={submit_stats['spearman']:+.2f}"
+                             if submit_stats else ""), fontsize=9)
+            axc.set_xlabel("certainty projection at the submit turn")
+            axc.set_ylabel("final optimality gap (log)")
+            axc.grid(alpha=0.3)
+        fig.suptitle("Certainty-probe validation on fresh rollouts "
+                     "(does it track LOCAL settledness, not solution quality?)",
+                     fontsize=11)
+        fig.tight_layout()
+        png = os.path.join(fresh_dir, "certainty_validation.png")
+        fig.savefig(png, dpi=130)
+        print(f"[project] wrote {png}")
+    except Exception as e:
+        print(f"[project] plots skipped ({e})")
+
+    with open(os.path.join(fresh_dir, "dual_projection_summary.json"), "w") as f:
+        json.dump(dict(
+            layer=layer, axis_cos=axis_cos,
+            certainty_directions=cert_path,
+            explore_directions=args.explore_directions,
+            explore_lastk=args.explore_lastk, exclude_window=args.exclude_window,
+            n_rollouts=len(per_ro), n_turn_rows=len(rows),
+            within_rollout_pearson_mean=(float(np.mean(within_r))
+                                         if within_r else None),
+            auroc_submit_turn=dict(certainty=au_c, explore=au_e, turn_index=au_t),
+            oos_behavioural_pearson=scatter_r,
+            local_k=args.local_k,
+            validation_correlations=validation,
+            certainty_at_submit_vs_final_gap=submit_stats,
+            pooling_exclusions=counts), f, indent=2)
+    print(f"[done] dual projection -> {fresh_dir}")
+
+
+# =========================================================================== #
+# --phase stepsizes -- model-free: per-turn weight-step trajectories of the
+# steered sweep runs (behavioural signature of the steering effect)
+# =========================================================================== #
+def _phase_stepsizes(args):
+    """For each steered run dir (e.g. runs/csat_certsteer_parabola_L22_am0.50):
+    read every rollout's canonical transcript, take the per-turn weight vector,
+    and compute the TURN-TO-TURN change of each coordinate, starting from 0 at
+    turn 0 (the parabola start is w = 0.5 per coordinate by env design, so the
+    turn-1 step is measured against 0.5). One line per (alpha, coordinate),
+    mean across rollouts with a sem band. --step-metric pct plots
+    100*(w_t - w_{t-1})/max(w_{t-1}, 1e-3) (the eps guards weights the model
+    drove to ~0); 'abs' plots the raw difference -- with weights all in [0,1]
+    the absolute view is often just as comparable across lines."""
+    dirs = args.steer_dirs or sorted(glob.glob(os.path.join(
+        args.out_dir, f"{args.steer_run_name}_parabola_L{args.layer}_a*")))
+    dirs = [d for d in dirs if os.path.isdir(d)
+            and os.path.exists(os.path.join(d, "steer_meta.json"))]
+    if not dirs:
+        raise SystemExit("no steered run dirs found; pass --steer-dirs "
+                         "explicitly (dirs containing steer_meta.json).")
+
+    W_INIT = 0.5                           # parabola reset(w_init=0.5)
+    EPS = 1e-3
+    rows, series = [], {}                  # (alpha, coord) -> {turn: [values]}
+    for d in dirs:
+        with open(os.path.join(d, "steer_meta.json")) as f:
+            alpha = float(json.load(f)["alpha"])
+        n_ro = 0
+        for rd in sorted(glob.glob(os.path.join(d, "rollout_*"))):
+            canon = _canonical_records(rd)
+            if not canon:
+                continue
+            n_ro += 1
+            ridx = int(os.path.basename(rd).split("_")[-1])
+            prev = None
+            for t in sorted(canon):
+                wv = canon[t]["weight_vec"]
+                if wv is None:
+                    continue
+                if prev is None:
+                    prev = [W_INIT] * len(wv)
+                dvec = [float(w) - float(wp) for w, wp in zip(wv, prev)]
+                for ci, (w, dw) in enumerate(zip(wv, dvec)):
+                    pct = 100.0 * dw / max(abs(float(prev[ci])), EPS)
+                    val = pct if args.step_metric == "pct" else dw
+                    series.setdefault((alpha, ci), {}).setdefault(t, []).append(val)
+                    rows.append(dict(dir=os.path.basename(d), alpha=alpha,
+                                     rollout=ridx, turn=t, coord=ci,
+                                     w=float(w), dw=dw, pct=pct))
+                # combined step SIZE ||w_t - w_{t-1}|| (default view; unsigned)
+                nrm = float(np.linalg.norm(dvec))
+                pn = 100.0 * nrm / max(float(np.linalg.norm(
+                    [float(x) for x in prev])), EPS)
+                series.setdefault((alpha, "all"), {}).setdefault(t, []).append(
+                    pn if args.step_metric == "pct" else nrm)
+                rows.append(dict(dir=os.path.basename(d), alpha=alpha,
+                                 rollout=ridx, turn=t, coord="all",
+                                 w=float(np.linalg.norm([float(x) for x in wv])),
+                                 dw=nrm, pct=pn))
+                prev = wv
+        print(f"[steps] {os.path.basename(d)}: alpha={alpha:+.2f}, "
+              f"{n_ro} rollouts")
+
+    out_dir = os.path.commonpath(dirs) if len(dirs) > 1 else os.path.dirname(
+        os.path.normpath(dirs[0]))
+    csv_path = os.path.join(out_dir, "certainty_stepsizes.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["dir", "alpha", "rollout", "turn",
+                                          "coord", "w", "dw", "pct"])
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"[steps] wrote {csv_path} ({len(rows)} rows)")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[steps] plot skipped ({e})")
+        return
+    fig, ax = plt.subplots(figsize=(8.5, 5))
+    alphas = sorted({a for (a, _c) in series})
+    cmap = {a: c for a, c in zip(alphas, ["tab:red", "tab:orange", "tab:gray",
+                                          "tab:cyan", "tab:blue"])}
+    want = (lambda c: c != "all") if args.per_coord else (lambda c: c == "all")
+    keys = [k for k in series if want(k[1])]
+    for (alpha, ci) in sorted(keys, key=lambda k: (k[0], str(k[1]))):
+        by_turn = series[(alpha, ci)]
+        xs = [0] + sorted(by_turn)                       # start the line at 0
+        mu = [0.0] + [float(np.mean(by_turn[t])) for t in xs[1:]]
+        se = [0.0] + [float(np.std(by_turn[t], ddof=1) / np.sqrt(len(by_turn[t])))
+                      if len(by_turn[t]) > 1 else 0.0 for t in xs[1:]]
+        ls = "-" if (ci == "all" or ci == 0) else "--"
+        lab = f"alpha {alpha:+.2f}" + ("" if ci == "all" else f"  w{ci}")
+        line, = ax.plot(xs, mu, ls, marker="o", ms=3,
+                        color=cmap.get(alpha, "k"), label=lab)
+        ax.fill_between(xs, np.array(mu) - np.array(se),
+                        np.array(mu) + np.array(se),
+                        color=line.get_color(), alpha=0.12)
+    ax.axhline(0, color="k", lw=0.8)
+    if args.per_coord:
+        unit = ("% change vs previous turn" if args.step_metric == "pct"
+                else "absolute change vs previous turn")
+        ylab, extra = f"weight step ({unit})", "w0 solid, w1 dashed; "
+    else:
+        unit = ("% of previous ||w||" if args.step_metric == "pct"
+                else "||w_t - w_(t-1)||")
+        ylab, extra = f"step size ({unit})", ""
+    ax.set_xlabel("turn")
+    ax.set_ylabel(ylab)
+    ax.set_title("Per-turn weight steps under certainty steering\n"
+                 f"(mean +/- sem across rollouts; {extra}"
+                 "hypothesis: +alpha -> smaller steps, -alpha -> truncated search)")
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    png = os.path.join(out_dir, f"certainty_stepsizes_{args.step_metric}.png")
+    fig.savefig(png, dpi=130)
+    print(f"[steps] wrote {png}")
+
+
+# =========================================================================== #
+# --phase bestmargin -- model-free: per-case BEST margin across the steered
+# sweep runs (paired by seed: identical landscapes per rollout index)
+# =========================================================================== #
+def _phase_bestmargin(args):
+    """For each steered run dir, per rollout: replay the canonical weight
+    trajectory through the EXACT parabola closed form (case.json) and take the
+    best margin any turn achieved. Rollouts are paired across alphas by case
+    SEED (run_steered uses the same seed range per alpha, so each case is the
+    same landscape everywhere). Reports mean/median best gap per alpha, win
+    counts (which alpha found the best point of the case, ties within
+    --tie-eps), and a per-case slope plot -- crossing lines = different cases
+    favour different injections.
+
+    Caveat printed below: with ONE rollout per (case, alpha) at temperature>0 a
+    case-level 'win' mixes the vector's effect with sampling luck; treat win
+    counts as descriptive unless you add repeats per cell."""
+    dirs = args.steer_dirs or sorted(glob.glob(os.path.join(
+        args.out_dir, f"{args.steer_run_name}_parabola_L{args.layer}_a*")))
+    dirs = [d for d in dirs if os.path.isdir(d)
+            and os.path.exists(os.path.join(d, "steer_meta.json"))]
+    if not dirs:
+        raise SystemExit("no steered run dirs found; pass --steer-dirs.")
+
+    data = {}                                  # seed -> {alpha: record}
+    for d in dirs:
+        with open(os.path.join(d, "steer_meta.json")) as f:
+            alpha = float(json.load(f)["alpha"])
+        for rd in sorted(glob.glob(os.path.join(d, "rollout_*"))):
+            cp = os.path.join(rd, "case.json")
+            canon = _canonical_records(rd)
+            if not os.path.exists(cp) or not canon:
+                continue
+            with open(cp) as f:
+                case = json.load(f)
+            seed = int(case.get("seed", -1))
+            mg = []
+            for t in sorted(canon):
+                wv = canon[t]["weight_vec"]
+                if wv is None:
+                    continue
+                m, g = _parabola_margin_gap(case, wv)
+                if m is not None:
+                    mg.append((t, m, g))
+            if not mg:
+                continue
+            best_t, best_m, best_g = max(mg, key=lambda x: x[1])
+            forced, sub_t = None, None
+            sp = os.path.join(rd, "submission.json")
+            if os.path.exists(sp):
+                with open(sp) as f:
+                    sub = json.load(f)
+                forced, sub_t = bool(sub.get("forced")), sub.get("submit_turn")
+            data.setdefault(seed, {})[alpha] = dict(
+                dir=os.path.basename(d), best_margin=best_m, best_gap=best_g,
+                best_turn=best_t, final_margin=mg[-1][1], n_turns=mg[-1][0],
+                submit_turn=sub_t, forced=forced)
+
+    alphas = sorted({a for v in data.values() for a in v})
+    complete = sorted(s for s, v in data.items() if set(alphas) <= set(v.keys()))
+    if not complete:
+        raise SystemExit("no seeds present in ALL steered dirs; check the runs.")
+    print(f"[best] alphas {alphas}; {len(complete)} paired cases "
+          f"({len(data) - len(complete)} incomplete, dropped)")
+
+    out_dir = os.path.commonpath(dirs) if len(dirs) > 1 else os.path.dirname(
+        os.path.normpath(dirs[0]))
+    csv_path = os.path.join(out_dir, "certainty_bestmargin.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["seed", "alpha", "dir", "best_margin",
+                                          "best_gap", "best_turn", "final_margin",
+                                          "n_turns", "submit_turn", "forced"])
+        w.writeheader()
+        for s in complete:
+            for a in alphas:
+                w.writerow(dict(seed=s, alpha=a, **data[s][a]))
+    print(f"[best] wrote {csv_path}")
+
+    # wins (per case, on best_margin; equivalent to best_gap within a case) ----
+    eps = args.tie_eps
+    wins = {a: 0 for a in alphas}
+    tied = 0
+    winners = {}
+    for s in complete:
+        bm = {a: data[s][a]["best_margin"] for a in alphas}
+        top = max(bm.values())
+        leaders = [a for a in alphas if bm[a] >= top - eps]
+        if len(leaders) == 1:
+            wins[leaders[0]] += 1
+            winners[s] = leaders[0]
+        else:
+            tied += 1
+            winners[s] = None
+
+    summary = {}
+    print(f"\n[best] per-alpha over {len(complete)} paired cases "
+          f"(gap = optimum margin - best margin; lower better):")
+    for a in alphas:
+        gaps = np.array([data[s][a]["best_gap"] for s in complete], float)
+        ranks = []
+        for s in complete:
+            order = sorted(alphas, key=lambda x: -data[s][x]["best_margin"])
+            ranks.append(order.index(a) + 1)
+        summary[a] = dict(mean_best_gap=float(gaps.mean()),
+                          median_best_gap=float(np.median(gaps)),
+                          mean_rank=float(np.mean(ranks)),
+                          wins=wins[a], n=len(complete))
+        print(f"   alpha {a:+.2f}: mean_gap={gaps.mean():.5f}  "
+              f"median_gap={np.median(gaps):.5f}  mean_rank={np.mean(ranks):.2f}  "
+              f"wins={wins[a]}/{len(complete)}")
+    print(f"   ties (within eps={eps:g}): {tied}")
+    print("[best] caveat: 1 rollout per (case, alpha) at temperature>0 -- a "
+          "'win' mixes the vector's effect with sampling luck. If both signs "
+          "win on different cases, that motivates STATE-DEPENDENT injection "
+          "(the csat trigger machinery), not a fixed alpha.")
+    with open(os.path.join(out_dir, "certainty_bestmargin.json"), "w") as f:
+        json.dump(dict(alphas=alphas, n_paired=len(complete), tie_eps=eps,
+                       ties=tied, per_alpha={str(a): v for a, v in summary.items()},
+                       winners={str(s): winners[s] for s in complete}),
+                  f, indent=2)
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[best] plot skipped ({e})")
+        return
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(11, 4.6),
+                                   gridspec_kw=dict(width_ratios=[2, 1]))
+    xs = np.arange(len(alphas))
+    for s in complete:
+        ys = [max(data[s][a]["best_gap"], 1e-9) for a in alphas]
+        axl.plot(xs, ys, "-o", ms=3, color="gray", alpha=0.45, lw=1)
+        wa = winners.get(s)
+        if wa is not None:
+            axl.plot([xs[alphas.index(wa)]], [max(data[s][wa]["best_gap"], 1e-9)],
+                     "*", ms=11, color="tab:green", zorder=3)
+    mean_ys = [max(summary[a]["mean_best_gap"], 1e-9) for a in alphas]
+    axl.plot(xs, mean_ys, "-o", ms=6, color="k", lw=2.5, label="mean", zorder=4)
+    axl.set_yscale("log")
+    axl.set_xticks(xs)
+    axl.set_xticklabels([f"{a:+.2f}" for a in alphas])
+    axl.set_xlabel("alpha")
+    axl.set_ylabel("best optimality gap (log; lower = better)")
+    axl.set_title("Best point found per case across alphas\n"
+                  "(one gray line per case; * = case winner; crossings = "
+                  "different cases favour different injections)", fontsize=9)
+    axl.legend(fontsize=8)
+    axl.grid(alpha=0.3)
+    bars = [wins[a] for a in alphas] + [tied]
+    axr.bar([f"{a:+.2f}" for a in alphas] + ["tie"], bars,
+            color=["tab:blue"] * len(alphas) + ["tab:gray"])
+    for i, b in enumerate(bars):
+        axr.text(i, b + 0.05, str(b), ha="center", fontsize=9)
+    axr.set_ylabel("cases won (best margin)")
+    axr.set_title(f"win counts (eps={eps:g})", fontsize=9)
+    axr.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    png = os.path.join(out_dir, "certainty_bestmargin.png")
+    fig.savefig(png, dpi=130)
+    print(f"[best] wrote {png}")
+
+
+# =========================================================================== #
 # Stage H -- causal steering along (c3 - c0) at layer 22
 # =========================================================================== #
 def certainty_token_norm(run_dir, layer, n_sample=300, seed=0):
@@ -883,10 +1723,15 @@ def main():
     cfg = Config()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--phase", choices=["generate", "analyse", "steer", "all"],
+    ap.add_argument("--phase",
+                    choices=["generate", "analyse", "steer", "project",
+                             "stepsizes", "bestmargin", "all"],
                     default="all",
                     help="generate (GPU, resumable) | analyse (CPU-only) | "
-                         "steer (GPU) | all")
+                         "steer (GPU) | project (CPU-only fresh-rollout dual "
+                         "read-out; needs --fresh-run-dir + --explore-directions) "
+                         "| stepsizes / bestmargin (CPU-only analyses of the "
+                         "steered sweep dirs) | all (generate+analyse+steer)")
     ap.add_argument("--run-name", default="csat_certainty",
                     help="run name for the generate phase (runs/<run-name>)")
     ap.add_argument("--run-dir", "--source-run-dir", dest="run_dir", default=None,
@@ -918,7 +1763,11 @@ def main():
                     help="rollouts drawn in the stage-G trajectory plot")
     ap.add_argument("--model", default=cfg.model_name, help="HF id override")
     ap.add_argument("--n-obj", type=int, default=2,
-                    help="parabola dimensionality (spec: 2 -> weights w0, w1)")
+                    help="weights dimensionality (2 for parabola; use 3 for "
+                         "coupling)")
+    ap.add_argument("--env", choices=["parabola", "coupling"], default="parabola",
+                    help="generate: environment for the rollouts (stepsizes/"
+                         "bestmargin closed-form replay remains parabola-only)")
     ap.add_argument("--max-turns", type=int, default=cfg.max_turns)
     ap.add_argument("--seed-start", type=int, default=cfg.seed_start)
     ap.add_argument("--temperature", type=float, default=cfg.temperature,
@@ -946,6 +1795,36 @@ def main():
                     help="stage H: skip test 1 (branch-at-submit)")
     ap.add_argument("--skip-sweep", action="store_true",
                     help="stage H: skip test 2 (whole-rollout alpha sweep)")
+    # stage I (--phase project)
+    ap.add_argument("--fresh-run-dir", default=None,
+                    help="project: run of FRESH rollouts (generate with a "
+                         "disjoint --seed-start) to project on both axes")
+    ap.add_argument("--explore-directions", default=None,
+                    help="project: directions file for the explore/persistence "
+                         "axis (e.g. runs/csat/directions_explore.npz, or "
+                         "runs/csat/directions.npz for SUBMIT-finalSET)")
+    ap.add_argument("--explore-lastk", type=int, default=30,
+                    help="project: explore-axis pooling window: mean over the "
+                         "explore-lastk tokens strictly before the verb "
+                         "(matches direction_extract's lastk-30 'before' pool)")
+    ap.add_argument("--align-window", type=int, default=8,
+                    help="project: turns before submit in the aligned plot")
+    ap.add_argument("--local-k", type=int, default=3,
+                    help="project: canonical probes before each turn used for "
+                         "the local-spread measure (validation tests)")
+    # --phase stepsizes
+    ap.add_argument("--steer-dirs", nargs="+", default=None,
+                    help="stepsizes: steered run dirs to compare (default: glob "
+                         "<out-dir>/<steer-run-name>_parabola_L<layer>_a*)")
+    ap.add_argument("--step-metric", choices=["pct", "abs"], default="pct",
+                    help="stepsizes: %% change vs previous turn (default) or "
+                         "absolute change")
+    ap.add_argument("--per-coord", action="store_true",
+                    help="stepsizes: plot w0/w1 separately instead of the "
+                         "combined step size ||w_t - w_(t-1)|| (default)")
+    ap.add_argument("--tie-eps", type=float, default=1e-4,
+                    help="bestmargin: margins within this of the case best "
+                         "count as a tie (margins are O(1e-2) in parabola)")
     args = ap.parse_args()
 
     cfg.model_name = args.model
@@ -962,6 +1841,12 @@ def main():
         _phase_generate(cfg, args)
     if args.phase in ("analyse", "all"):
         _phase_analyse(args)
+    if args.phase == "project":
+        _phase_project(args)
+    if args.phase == "stepsizes":
+        _phase_stepsizes(args)
+    if args.phase == "bestmargin":
+        _phase_bestmargin(args)
     if args.phase in ("steer", "all"):
         _phase_steer(args)
 
